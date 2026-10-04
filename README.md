@@ -29,6 +29,19 @@ Executables for Windows, Linux and macOS are on the
 | Linux | `dcalc-linux-x64` | `chmod +x dcalc-linux-x64`, then `./dcalc-linux-x64` |
 | macOS (Apple Silicon) | `dcalc-macos-arm64` | `chmod +x dcalc-macos-arm64`, `xattr -d com.apple.quarantine dcalc-macos-arm64`, then `./dcalc-macos-arm64` |
 
+dcalc is a terminal program. Run it from a terminal (or PowerShell on Windows). On
+Linux, double-clicking the file in a file manager does nothing visible, because no
+terminal is attached and the program exits at once. To start it from a launcher,
+create a `.desktop` file with `Terminal=true`:
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=dcalc
+Exec=/full/path/to/dcalc-linux-x64
+Terminal=true
+```
+
 > Unsigned executables may trigger a SmartScreen or Gatekeeper warning.
 > On Windows: **More info**, then **Run anyway**.
 

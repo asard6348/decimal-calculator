@@ -127,7 +127,7 @@ jobs:
           | Linux (64-bit) | \`$APP_NAME-linux-x64\` |
           | macOS (Apple Silicon) | \`$APP_NAME-macos-arm64\` |
 
-          On Linux and macOS: \`chmod +x <file>\`. The files are unsigned, see the README. \`SHA256SUMS.txt\` holds the checksums.
+          On Linux and macOS: \`chmod +x <file>\`, then run it from a terminal. The files are unsigned, see the README. \`SHA256SUMS.txt\` holds the checksums.
           EOF
 
       - name: Create GitHub Release and upload assets
