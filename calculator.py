@@ -19,7 +19,9 @@ Code structure:
 
 import ast
 import builtins
+import contextlib
 import decimal
+import difflib
 import inspect
 import io
 import json
@@ -48,10 +50,15 @@ mpmath.mp.dps = 55
 ISO_INLINE   = True
 GUARD_DIGITS = 20
 IMG          = True
+NO_ASK       = False      # --no-ask / --pipe: never ask a question, fail instead
+NO_LOOP      = False      # --no-loop / --pipe / --no-prompt: no 'x>' loop after an answer
+_ERROR_COUNT = [0]        # error messages printed so far (decides the exit status of scripted runs)
+_ERRORS_TO_STDERR = [False]
 
 
 RED    = "\x1b[38;2;255;0;0m"
 DRED    = "\x1b[38;2;104;0;0m"
+DEL    = "\x1b[38;2;240;60;60m"      # removal confirmations; RED is reserved for errors
 YELLOW = "\x1b[38;2;204;204;0m"
 BRBL   = "\x1b[38;2;0;150;255m"
 LSBL   = "\x1b[38;2;94;140;255m"
@@ -70,10 +77,16 @@ def _plain(text):
 
 
 def print(*args, **kwargs):
+    if args and isinstance(args[0], str) and args[0].startswith(RED):      # an error message
+        _ERROR_COUNT[0] += 1
+        if _ERRORS_TO_STDERR[0] and 'file' not in kwargs:
+            kwargs['file'] = sys.stderr
     builtins.print(*[_plain(a) for a in args], **kwargs)
 
 
 def input(prompt=''):
+    if NO_ASK:
+        raise _AskDenied(prompt)
     return builtins.input(_plain(prompt))
 
 
@@ -97,6 +110,17 @@ def _tidy_pyerror(msg: str) -> str:
 class CalcError(Exception):
     """An expected, user-facing error: its message is printed as-is, without a traceback."""
     pass
+
+
+class _AskDenied(CalcError):
+    """Raised instead of asking a question while questions are off (--no-ask, --pipe)."""
+    def __init__(self, prompt: str = ''):
+        name = _ANSI_RE.sub('', prompt).strip().rstrip(':').strip()
+        if not name or '[' in name:
+            super().__init__(f"'{name}' has no value." if name else "A value is missing.")
+            return
+        nm = name if len(name) == 1 else f"_{name}_"
+        super().__init__(f"'{name}' has no value. Give it one first: {nm}=5;<expression>, var {nm} 5, or --set {nm}=5")
 
 
 def _fmt_error(msg: str) -> str:
@@ -3077,12 +3101,12 @@ def _restore_all(snap: dict) -> int:
     return len(vars_) + len(consts)
 
 
-def _autoload_default() -> None:
+def _autoload_default(announce: bool = True) -> None:
     try:
         data = _read_saves()
         if data['default'] and data['default'] in data['saves']:
             _cmd_load(data['default'], quiet=True)
-            print(f"{GRAY}loaded default save '{data['default']}'{RST}")
+            if announce: print(f"{GRAY}loaded default save '{data['default']}'{RST}")
     except CalcError as ex:
         print(_fmt_error(str(ex)))
 
@@ -3091,6 +3115,8 @@ def _autoload_default() -> None:
 
 
 def _confirm(question: str) -> bool:
+    if NO_ASK:
+        return True
     try:
         return input(f"{YELLOW}{question} [y/N]{RST} ").strip().lower() in ('y', 'yes')
     except (KeyboardInterrupt, EOFError):
@@ -3176,7 +3202,7 @@ def _cmd_imgrm(rest: str) -> None:
         if uid is None or uid not in _UNIT_LIST:
             print(_fmt_error(f"Imaginary unit '{_disp_name(key)}' does not exist.")); continue
         _UNIT_LIST.remove(uid); _UNIT_OFF.discard(uid)
-        print(f"{RED}- {_disp_name(key)}{RST}  {GRAY}(unit removed){RST}")
+        print(f"{DEL}- {_disp_name(key)}{RST}  {GRAY}(unit removed){RST}")
         _unit_refresh()
     _unit_refresh(old_pb)
 
@@ -3186,7 +3212,7 @@ def _cmd_imgrmall() -> None:
     n, old_pb = len(_UNIT_LIST), _primary_bit()
     _UNIT_LIST.clear(); _UNIT_OFF.clear()
     _unit_refresh(old_pb)
-    print(f"{RED}- removed {n} unit{'s' if n != 1 else ''}{RST}")
+    print(f"{DEL}- removed {n} unit{'s' if n != 1 else ''}{RST}")
 
 
 _ASSIGN_RE = re.compile(_NAME_TOK_RE + r'\s*(?:\*\*|//|[+\-*/|])?=(?!=)')
@@ -3274,7 +3300,7 @@ def _cmd_constrm(rest: str) -> None:
     for key in _names(rest, "Usage: constrm <name> [name ...]"):
         if key not in _const_vars: print(_fmt_error(f"Constant '{_disp_name(key)}' does not exist.")); continue
         del _const_vars[key]
-        print(f"{RED}- {_disp_name(key)}{RST}  {GRAY}(constant removed){RST}")
+        print(f"{DEL}- {_disp_name(key)}{RST}  {GRAY}(constant removed){RST}")
 
 
 def _cmd_constex(rest: str) -> None:
@@ -3296,7 +3322,7 @@ def _cmd_constrmall() -> None:
     if not _const_vars: print(f"{GRAY}No constants defined.{RST}"); return
     n = len(_const_vars)
     _const_vars.clear()
-    print(f"{RED}- removed {n} constant{'s' if n != 1 else ''}{RST}")
+    print(f"{DEL}- removed {n} constant{'s' if n != 1 else ''}{RST}")
 
 
 def _var_one(item: str) -> None:
@@ -3347,7 +3373,7 @@ def _cmd_varrm(rest: str) -> None:
             print(_fmt_error(f"'{_disp_name(key)}' is a constant \u2014 remove it with: constrm {_disp_name(key)}")); continue
         if key not in _user_vars: print(_fmt_error(f"Variable '{_disp_name(key)}' does not exist.")); continue
         del _user_vars[key]
-        print(f"{RED}- {_disp_name(key)}{RST}  {GRAY}(variable removed){RST}")
+        print(f"{DEL}- {_disp_name(key)}{RST}  {GRAY}(variable removed){RST}")
 
 
 def _cmd_varrmall() -> None:
@@ -3355,7 +3381,7 @@ def _cmd_varrmall() -> None:
     n = len(_user_vars)
     _user_vars.clear()
     _last_lambda[0] = None
-    print(f"{RED}- removed {n} variable{'s' if n != 1 else ''}{RST}"
+    print(f"{DEL}- removed {n} variable{'s' if n != 1 else ''}{RST}"
           f"{GRAY}{' (constants kept)' if _const_vars else ''}{RST}")
 
 
@@ -3415,7 +3441,7 @@ def _cmd_saverm(rest: str) -> None:
     if name not in data['saves']: print(_fmt_error(f"No save named '{name}'.")); return
     del data['saves'][name]
     if data['default'] == name: data['default'] = None
-    _write_saves(data); print(f"{RED}- removed save{RST} '{name}'")
+    _write_saves(data); print(f"{DEL}- removed save{RST} '{name}'")
 
 
 def _cmd_savesrmall() -> None:
@@ -3423,7 +3449,7 @@ def _cmd_savesrmall() -> None:
     if not data['saves']: print(f"{GRAY}No saves yet.{RST}"); return
     if not _confirm(f"Delete all {len(data['saves'])} saves?"): print(f"{GRAY}Kept.{RST}"); return
     data['saves'].clear(); data['default'] = None; _write_saves(data)
-    print(f"{RED}- removed all saves{RST}")
+    print(f"{DEL}- removed all saves{RST}")
 
 
 def _cmd_saveren(rest: str) -> None:
@@ -3615,7 +3641,7 @@ def hlp():
 {BOLD}Saves{RST} (file: ./calculator_saves.json in the current directory, created on the first save; or $CALC_SAVES):
   {GREEN}save n{RST}  {GREEN}load n{RST}  {GREEN}saves{RST}  {GREEN}saverm n{RST}  {GREEN}savesrmall{RST}  {GREEN}saveren n new{RST}
   {GREEN}savedefault [n]{RST}   make save n (or a fresh 'default' snapshot) load at startup
-  Set NO_COLOR=1 to turn colors off.
+  Set NO_COLOR=1 to turn colors off.  Command-line options (--pipe, --no-prompt, ...): run with --help.
 """)
 
 
@@ -4595,6 +4621,8 @@ def _paint(res, text: str) -> str:
         return VIOLET + re.sub(r'([{},])', lambda m: f"{GRAY}{m.group(1)}{VIOLET}", text) + RST
     if isinstance(res, Lambda):
         return f"{LSBL}{text}{RST}"
+    if isinstance(res, _CPLX):
+        return f"{BRBL}{text}{RST}"
     if isinstance(res, dec):
         return f"{WHITE}{text}{RST}"
     return text
@@ -4914,7 +4942,7 @@ def evaluate(raw: str) -> None:
     if res is _ABORT or res is _BACK: return
     _print_result(res, assigned_set)
 
-    if not det_vars and not resolved_names and not asked_sub_keys: return
+    if NO_LOOP or (not det_vars and not resolved_names and not asked_sub_keys): return
 
     _repeat_loop(exp, cur_vars, resolved_names, asked_sub_keys, det_vars, all_vars,
                  assigned_set, inline_str, already_set, fixed_inline, resolved_base_vals)
@@ -4923,25 +4951,211 @@ def evaluate(raw: str) -> None:
 # MAIN
 
 
-def main(argv=None) -> None:
+class _UsageError(Exception):
+    """A mistake on the command line."""
+
+
+# option -> (key, takes a value)
+_CLI_OPTIONS = {
+    '--help': ('help', False),
+    '--pipe': ('pipe', False), '--no-prompt': ('no_prompt', False),
+    '--no-loop': ('no_loop', False), '--no-ask': ('no_ask', False),
+    '--no-color': ('no_color', False), '--no-colors': ('no_color', False), '--color': ('color', False),
+    '--no-default': ('no_default', False),
+    '--prec': ('prec', True), '--set': ('set', True), '--const': ('const', True),
+    '--load': ('load', True), '--saves': ('saves', True),
+}
+
+
+def _cli_help(prog: str) -> str:
+    return f"""Usage: {prog} [options] [--] [expression ...]
+
+Arbitrary-precision calculator. The expressions on the command line are evaluated first,
+then you get the >> prompt (type help there for the syntax).  An argument is an option only
+if it is listed below, so expressions such as -7//2 work as they are; -- ends the options.
+
+Modes
+  --pipe          script mode: also read expressions from standard input, one per line, and
+                  print only the results. No prompt, no colors, no questions. Errors go to
+                  standard error. Empty lines and lines starting with # are skipped.
+  --no-prompt     evaluate the expressions on the command line, then exit (no >> prompt, and
+                  no variable loop either; missing values are still asked for)
+  --no-loop       after an answer, do not stay in the variable loop (the x> prompt)
+  --no-ask        never ask for a missing value: it is an error instead (const replaces an
+                  existing constant without asking). --pipe means --no-ask --no-loop.
+
+Look
+  --no-color, --no-colors   turn colors off (the NO_COLOR environment variable does too)
+  --color                   force colors on, even when NO_COLOR is set. Without it colors are off
+                            for --pipe, and for --no-prompt when the output is not a terminal.
+
+Start-up
+  --prec N        show N digits, like the prec command
+  --set A=1       store a variable first, like the var command (--set "a=1 b=2" for several)
+  --const A=1     store a constant first, like the const command (may be repeated too)
+  --load NAME     load a save instead of the default one
+  --no-default    do not load the default save
+  --saves FILE    keep saves in FILE (the CALC_SAVES environment variable does too)
+
+  --help          show this help and exit
+
+Exit status: 0 on success, 1 if an expression or command failed (--pipe, --no-prompt),
+2 for a mistake on the command line.
+
+Examples
+  {prog} "2(5)" "sqrt(2)"                 evaluate two expressions, then prompt
+  {prog} --no-prompt "sin(pi/6)"          print 0.5 and exit
+  echo "1/3" | {prog} --pipe --prec 10    print 0.3333333333
+  {prog} --pipe --set x=4 < file.txt     evaluate every line of file.txt with x = 4
+"""
+
+
+def _parse_args(argv) -> dict:
+    opts = {'help': False, 'pipe': False, 'no_prompt': False, 'no_loop': False, 'no_ask': False,
+            'color': None, 'no_default': False, 'prec': None, 'set': [], 'const': [], 'load': None,
+            'saves': None, 'exprs': []}
+    i, only_exprs = 0, False
+    while i < len(argv):
+        a = argv[i]; i += 1
+        if a == '--' and not only_exprs:
+            only_exprs = True; continue
+        is_opt = a in _CLI_OPTIONS or (a.startswith('--') and len(a) > 2 and a[2].isalpha())
+        if only_exprs or not is_opt:
+            opts['exprs'].append(a); continue
+        name, eq, val = a.partition('=')
+        spec = _CLI_OPTIONS.get(name)
+        if spec is None:
+            near = difflib.get_close_matches(name, [o for o in _CLI_OPTIONS if o.startswith('--')], n=1)
+            raise _UsageError(f"unknown option '{name}'." + (f" Did you mean {near[0]}?" if near else ''))
+        key, takes_value = spec
+        if not takes_value:
+            if eq: raise _UsageError(f"option '{name}' does not take a value.")
+            if key == 'no_color':   opts['color'] = False
+            elif key == 'color':    opts['color'] = True
+            else:                   opts[key] = True
+            continue
+        if not eq:
+            if i >= len(argv): raise _UsageError(f"option '{name}' needs a value.")
+            val = argv[i]; i += 1
+        if key in ('set', 'const'):
+            if '=' not in val: raise _UsageError(f"option '{name}' needs NAME=VALUE, got '{val}'.")
+            opts[key].append(val)
+        elif key == 'prec':
+            try: n = int(val)
+            except ValueError: n = 0
+            if n < 1: raise _UsageError(f"option '--prec' needs a whole number of at least 1, got '{val}'.")
+            opts['prec'] = n
+        else:
+            opts[key] = val
+    return opts
+
+
+def _die(msg: str, status: int = 2) -> None:
+    prog = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else 'calculator.py'
+    sys.stderr.write(f"{prog}: {msg}\n")
+    sys.exit(status)
+
+
+def _cli_setup(fn, label: str) -> str:
+    """Run a start-up step silently. A step that fails ends the program with status 2. Returns its output."""
+    before = _ERROR_COUNT[0]
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            fn()
+        except CalcError as ex:
+            print(_fmt_error(str(ex)))
+    text = _ANSI_RE.sub('', out.getvalue() + err.getvalue()).strip()
+    if _ERROR_COUNT[0] != before:
+        _die(f"{label}: {text}")
+    return text
+
+
+def _run_line(raw: str) -> None:
+    try:
+        evaluate(raw)
+    except _AskDenied as ex:
+        print(_fmt_error(str(ex)))
+
+
+def _main(argv=None) -> None:
+    global NO_ASK, NO_LOOP, _NO_COLOR
     argv = sys.argv[1:] if argv is None else argv
-    _autoload_default()
+    try:
+        opts = _parse_args(argv)
+    except _UsageError as ex:
+        prog = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else 'calculator.py'
+        sys.stderr.write(f"{prog}: {ex}\nTry '{prog} --help'.\n")
+        sys.exit(2)
+    if opts['help']:
+        _NO_COLOR = True
+        print(_cli_help(os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else 'calculator.py'))
+        return
+
+    pipe, once = opts['pipe'], opts['no_prompt']
+    scripted   = pipe or once
+    plain_out  = pipe or (once and not sys.stdout.isatty())      # scripted output should not carry color codes
+    _NO_COLOR  = (plain_out or _NO_COLOR) if opts['color'] is None else not opts['color']
+    NO_ASK     = opts['no_ask'] or pipe
+    NO_LOOP    = opts['no_loop'] or scripted
+    if opts['saves']:
+        os.environ['CALC_SAVES'] = opts['saves']
+    if pipe:
+        try: sys.stdout.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError): pass
+
+    # start-up steps: saves, precision, variables, constants (questions are answered "yes" here)
+    ask_before, NO_ASK = NO_ASK, True
+    if opts['load']:
+        text = _cli_setup(lambda: _cmd_load(opts['load'], quiet=scripted), f"--load {opts['load']}")
+        if text and not scripted: print(f"{GRAY}{text}{RST}")
+    elif not opts['no_default']:
+        _autoload_default(announce=not scripted)
+    if opts['prec'] is not None:
+        _cli_setup(lambda: actions(f"prec {opts['prec']}"), f"--prec {opts['prec']}")
+    for item in opts['set']:
+        _cli_setup(lambda: _cmd_var(item), f"--set {item}")
+    for item in opts['const']:
+        _cli_setup(lambda: _cmd_const(item), f"--const {item}")
+    NO_ASK = ask_before
+    _ERROR_COUNT[0] = 0
+    _ERRORS_TO_STDERR[0] = scripted
 
     try:
-        for arg in argv:
-            evaluate(arg.strip())
-        while True:
-            if _pending_expr[0] is not None:
-                raw = _pending_expr[0]; _pending_expr[0] = None
-            else:
-                raw = input(f"{BRBL}{BOLD}>>{RST} ").strip()
-            if not raw or raw.lower() == 'new': continue
-            evaluate(raw)
+        for arg in opts['exprs']:
+            _run_line(arg.strip())
+        if pipe:
+            for line in sys.stdin:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    _run_line(line)
+        elif not once:
+            while True:
+                if _pending_expr[0] is not None:
+                    raw = _pending_expr[0]; _pending_expr[0] = None
+                else:
+                    raw = builtins.input(_plain(f"{BRBL}{BOLD}>>{RST} ")).strip()
+                if not raw or raw.lower() == 'new': continue
+                _run_line(raw)
     except EOFError:
         print(_fmt_error("EOFError: Input stream interrupted."))
-        sys.exit()
+        sys.exit(1 if scripted else 0)
     except KeyboardInterrupt:
         print()
+        if scripted: sys.exit(130)
+    if scripted and _ERROR_COUNT[0]:
+        sys.exit(1)
+
+
+def main(argv=None) -> None:
+    try:
+        _main(argv)
+    except BrokenPipeError:            # e.g. `... | head`: the reader went away, so stop quietly
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except (OSError, ValueError):
+            pass
+        sys.exit(1)
 
 
 if __name__ == '__main__':

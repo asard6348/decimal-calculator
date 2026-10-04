@@ -33,6 +33,9 @@ then you get the prompt:
 python calculator.py "2(5)" "sqrt(2)"
 ```
 
+To use it in scripts, or to see all the options, read [Command line](#command-line)
+(`python calculator.py --help` shows the same list).
+
 ## The basics
 
 Type an expression and press Enter.
@@ -542,11 +545,98 @@ The saves are written to `calculator_saves.json` in the folder you start
 the program from. The file is created the first time you save. Set the
 environment variable `CALC_SAVES` to use another path.
 
+## Command line
+
+```
+python calculator.py [options] [--] [expression ...]
+```
+
+An argument is an option only if it is in the lists below, so an expression such
+as `-7//2` can be given as it is. If you want to be sure, put `--` before the
+expressions.
+
+### Modes
+
+| Option | What it does |
+| --- | --- |
+| `--pipe` | Script mode. Also reads expressions from standard input, one per line, and prints only the results: no prompt, no colors, no questions. Errors go to standard error. Empty lines and lines starting with `#` are skipped. |
+| `--no-prompt` | Evaluates the expressions on the command line, then exits instead of showing the `>>` prompt. There is no variable loop either. |
+| `--no-loop` | After an answer, does not stay in the variable loop (the `x>` prompt), see [Variables](#variables). |
+| `--no-ask` | Never asks for a missing value: it is an error instead. `const` replaces an existing constant without asking. |
+
+`--pipe` means `--no-ask` and `--no-loop` as well. A value that is needed but
+missing is reported with the way to give it one:
+
+```
+$ echo "x*2" | python calculator.py --pipe
+'x' has no value. Give it one first: x=5;<expression>, var x 5, or --set x=5
+```
+
+### Look
+
+| Option | What it does |
+| --- | --- |
+| `--no-color`, `--no-colors` | Turns the colors off, like `NO_COLOR=1`. |
+| `--color` | Forces the colors on, even if `NO_COLOR` is set. |
+
+Without these, colors are on, except for `--pipe`, and for `--no-prompt` when
+the output goes to a file or a pipe. The last of `--color` and `--no-color`
+wins.
+
+### Start-up
+
+| Option | What it does |
+| --- | --- |
+| `--prec N` | Shows N digits, like the `prec` command. |
+| `--set A=1` | Stores a variable first, like `var`. Write `--set "a=1 b=2"` for several, or repeat the option. |
+| `--const A=1` | Stores a constant first, like `const`. |
+| `--load NAME` | Loads a save instead of the default one. |
+| `--no-default` | Does not load the default save. |
+| `--saves FILE` | Keeps the saves in FILE, like `CALC_SAVES`. |
+| `--help` | Shows the list of options and exits. |
+
+These steps run before the first expression, silently. If one fails, nothing
+else runs and the exit status is 2.
+
+### Examples
+
+```
+$ python calculator.py --no-prompt "sin(pi/6)" "2^64"
+0.5
+18446744073709551616
+$ echo "1/3" | python calculator.py --pipe --prec 10
+0.3333333333
+$ cat prices.txt
+# price with 21% tax
+x*1.21
+$ python calculator.py --pipe --set x=100 < prices.txt
+121
+$ python calculator.py --no-prompt --set "a=2 b=3" --const k=10 "a*b+k"
+16
+```
+
+In `--pipe` mode a failing line does not stop the others. Its message goes to
+standard error, so the results stay clean:
+
+```
+$ printf '2+2\n1/0\nsqrt(16)\n' | python calculator.py --pipe 2>/dev/null
+4
+4
+```
+
+### Exit status
+
+| Status | Meaning |
+| --- | --- |
+| 0 | Everything worked. An interactive session always ends with 0. |
+| 1 | An expression or command failed (only for `--pipe` and `--no-prompt`). |
+| 2 | A mistake on the command line, or a start-up step failed. |
+
 ## Settings
 
-- `NO_COLOR=1` turns the colors off.
-- `CALC_SAVES=path` sets where saves are kept.
-- `prec` and `img` are described above.
+- `NO_COLOR=1` or `--no-color` turns the colors off.
+- `CALC_SAVES=path` or `--saves path` sets where saves are kept.
+- `prec` and `img` are described above, `--prec` is the command-line form of `prec`.
 
 ## Errors
 
