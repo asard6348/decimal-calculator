@@ -1,4 +1,4 @@
-"""Arbitrary-precision expression calculator.
+"""dcalc: an arbitrary-precision expression calculator.
 
 Code structure:
      1. Imports
@@ -42,6 +42,7 @@ except ImportError:
 # INTERNAL VARIABLES
 
 
+VERSION       = "1.0.0"
 dec           = decimal.Decimal
 ctx           = decimal.getcontext()
 ctx.prec      = 50
@@ -117,10 +118,10 @@ class _AskDenied(CalcError):
     def __init__(self, prompt: str = ''):
         name = _ANSI_RE.sub('', prompt).strip().rstrip(':').strip()
         if not name or '[' in name:
-            super().__init__(f"'{name}' has no value." if name else "A value is missing.")
+            super().__init__(f"'{name}' is not set." if name else "A value is missing.")
             return
         nm = name if len(name) == 1 else f"_{name}_"
-        super().__init__(f"'{name}' has no value. Give it one first: {nm}=5;<expression>, var {nm} 5, or --set {nm}=5")
+        super().__init__(f"'{name}' is not set. Use {nm}=5;<expression>, var {nm} 5 or --set {nm}=5")
 
 
 def _fmt_error(msg: str) -> str:
@@ -2953,12 +2954,12 @@ def _stored_value(expr: str, what: str = "Constant"):
     return None
 
 
-_SAVE_FILENAME = 'calculator_saves.json'
+_SAVE_FILENAME = 'dcalc_saves.json'
 
 
 def _save_path() -> str:
-    """Save file: $CALC_SAVES if set, else calculator_saves.json in the current working directory."""
-    return os.environ.get('CALC_SAVES') or os.path.join(os.getcwd(), _SAVE_FILENAME)
+    """Save file: $DCALC_SAVES if set, else dcalc_saves.json in the current working directory."""
+    return os.environ.get('DCALC_SAVES') or os.path.join(os.getcwd(), _SAVE_FILENAME)
 
 
 _DEFAULT_SAVE = 'default'
@@ -3553,7 +3554,7 @@ def hlp():
     ]))
     print(f"""
 {BOLD}Quick reference:{RST}
-  Commands:   help / new / back / prec <n> / img... / var... / const... / save... / load   (Ctrl+D quits)
+  Commands:   help / new / back / prec <n> / img... / var... / const... / save... / load   (quit: Ctrl+D, on Windows Ctrl+Z then Enter)
   Operators:  + - * / ** // %     (^ is the same as **)
   Variables:  single letters, or a word in underscores like _speed_
   Subscript:  x[1] / _work_[0] / {{0,1}}[0]
@@ -3618,30 +3619,28 @@ def hlp():
   {GREEN}until(step, .., cond){RST} same steps, stops once cond is true (checked after each tick).
                    Example:  x={{0,1}}; until(x+=, x[10]==10)     (aliases: rep, unt)
 
-{BOLD}Variables{RST} (functions and sets you assign are kept automatically; numbers only with {GREEN}var{RST}):
-  {GREEN}var x 5{RST} / {GREEN}var x=5{RST} / {GREEN}var x+=1{RST}   store or change a variable of any kind (no question asked)
-  {GREEN}var a=1 b=2{RST}   several at once (the next {GREEN}name={RST} starts a new one; values may contain spaces)
-  {GREEN}var x{RST} show   {GREEN}var{RST} list all   {GREEN}varrm x y{RST} remove   {GREEN}varrmall{RST} remove all (constants stay)
+{BOLD}Variables{RST} (assigned functions and sets are kept; numbers only through var):
+  {GREEN}var x 5{RST}  {GREEN}var x=5{RST}  {GREEN}var x+=1{RST}   store or change a variable
+  {GREEN}var a=1 b=2{RST}   several at once; a value may contain spaces
+  {GREEN}var x{RST} show   {GREEN}var{RST} list   {GREEN}varrm x y{RST} remove   {GREEN}varrmall{RST} remove all
 
-{BOLD}Constants:{RST}
-  {GREEN}const x 5{RST} / {GREEN}const x=5{RST} / {GREEN}const x+=1{RST}   define, redefine (asks first) or update
+{BOLD}Constants{RST} (kept apart from variables; varrmall leaves them):
+  {GREEN}const x 5{RST}  {GREEN}const x=5{RST}  {GREEN}const x+=1{RST}   define (asks before replacing) or update
   {GREEN}const a=1 b=2{RST}   several at once
-  {GREEN}const x{RST} show   {GREEN}const{RST} list all   {GREEN}constrm x y{RST} remove   {GREEN}constex x{RST} exists?   {GREEN}constin x{RST} info
-  {GREEN}constrmall{RST} remove all.  Constants are kept apart from variables: {GREEN}varrmall{RST} does not touch them.
+  {GREEN}const x{RST} show   {GREEN}const{RST} list   {GREEN}constrm x y{RST} remove   {GREEN}constex x{RST} exists   {GREEN}constin x{RST} info   {GREEN}constrmall{RST} remove all
 
 {BOLD}Imaginary units:{RST}
-  {GREEN}img{RST}            list the units (the first one that is on is the {BOLD}main{RST} unit: sqrt(-4) uses it)
-  {GREEN}img j k{RST}        add units (a letter or a _long_name_); a unit you already have is switched on or off
-  {GREEN}imgrm j k{RST}      remove units    {GREEN}imgrmall{RST}   remove all units ({GREEN}i{RST} too)
-  Every unit squares to -1 and different units are independent, so  (1+2i+3j)*(1-j)  keeps both parts.
-  Mixed products such as i*j are a part of their own and square to +1.  + - * / and whole-number powers
-  work with any mix of units; sqrt, sin, abs, non-whole powers... take one unit at a time.
-  A real negative root gives the main unit:  sqrt(-4) → 2i
+  {GREEN}img{RST}        list (the first one that is on is the main unit, used by sqrt(-4))
+  {GREEN}img j k{RST}    add units (a letter or _long_name_), or switch existing ones on/off
+  {GREEN}imgrm j k{RST}  remove units     {GREEN}imgrmall{RST}  remove all, i too
+  Units square to -1 and are independent: (1+2i+3j)*(1-j) keeps both parts, and i*j is a part
+  of its own (it squares to +1). + - * / and whole-number powers take any mix of units;
+  sqrt, sin, abs, other powers take one unit at a time.
 
-{BOLD}Saves{RST} (file: ./calculator_saves.json in the current directory, created on the first save; or $CALC_SAVES):
+{BOLD}Saves{RST} (file: ./dcalc_saves.json, or $DCALC_SAVES):
   {GREEN}save n{RST}  {GREEN}load n{RST}  {GREEN}saves{RST}  {GREEN}saverm n{RST}  {GREEN}savesrmall{RST}  {GREEN}saveren n new{RST}
   {GREEN}savedefault [n]{RST}   make save n (or a fresh 'default' snapshot) load at startup
-  Set NO_COLOR=1 to turn colors off.  Command-line options (--pipe, --no-prompt, ...): run with --help.
+  NO_COLOR=1 turns colors off.  Command-line options: --help
 """)
 
 
@@ -4621,9 +4620,7 @@ def _paint(res, text: str) -> str:
         return VIOLET + re.sub(r'([{},])', lambda m: f"{GRAY}{m.group(1)}{VIOLET}", text) + RST
     if isinstance(res, Lambda):
         return f"{LSBL}{text}{RST}"
-    if isinstance(res, _CPLX):
-        return f"{BRBL}{text}{RST}"
-    if isinstance(res, dec):
+    if isinstance(res, (dec, _CPLX)):
         return f"{WHITE}{text}{RST}"
     return text
 
@@ -4957,7 +4954,7 @@ class _UsageError(Exception):
 
 # option -> (key, takes a value)
 _CLI_OPTIONS = {
-    '--help': ('help', False),
+    '--help': ('help', False), '--version': ('version', False),
     '--pipe': ('pipe', False), '--no-prompt': ('no_prompt', False),
     '--no-loop': ('no_loop', False), '--no-ask': ('no_ask', False),
     '--no-color': ('no_color', False), '--no-colors': ('no_color', False), '--color': ('color', False),
@@ -4968,50 +4965,33 @@ _CLI_OPTIONS = {
 
 
 def _cli_help(prog: str) -> str:
-    return f"""Usage: {prog} [options] [--] [expression ...]
+    return f"""usage: {prog} [options] [--] [expression ...]
 
-Arbitrary-precision calculator. The expressions on the command line are evaluated first,
-then you get the >> prompt (type help there for the syntax).  An argument is an option only
-if it is listed below, so expressions such as -7//2 work as they are; -- ends the options.
+Evaluates the expressions, then starts the prompt (type help for the syntax).
+Only the options below are options, so -7//2 is an expression. -- ends the options.
 
-Modes
-  --pipe          script mode: also read expressions from standard input, one per line, and
-                  print only the results. No prompt, no colors, no questions. Errors go to
-                  standard error. Empty lines and lines starting with # are skipped.
-  --no-prompt     evaluate the expressions on the command line, then exit (no >> prompt, and
-                  no variable loop either; missing values are still asked for)
-  --no-loop       after an answer, do not stay in the variable loop (the x> prompt)
-  --no-ask        never ask for a missing value: it is an error instead (const replaces an
-                  existing constant without asking). --pipe means --no-ask --no-loop.
+  --pipe         read expressions from stdin, one per line (# lines are skipped);
+                 print results only: no prompt, colors or questions, errors to stderr.
+                 implies --no-ask and --no-loop
+  --no-prompt    exit after the given expressions; implies --no-loop
+  --no-loop      skip the variable loop (x>) after an answer
+  --no-ask       fail on a missing value instead of asking
+  --no-color     colors off (also --no-colors; NO_COLOR is honored)
+  --color        colors on, overriding NO_COLOR and --pipe
+  --prec N       display N digits
+  --set A=1      store a variable first ("a=1 b=2" for several)
+  --const A=1    store a constant first
+  --load NAME    load save NAME instead of the default one
+  --no-default   do not load the default save
+  --saves FILE   save file (default ./dcalc_saves.json, or $DCALC_SAVES)
+  --version      print the version
+  --help         print this help
 
-Look
-  --no-color, --no-colors   turn colors off (the NO_COLOR environment variable does too)
-  --color                   force colors on, even when NO_COLOR is set. Without it colors are off
-                            for --pipe, and for --no-prompt when the output is not a terminal.
-
-Start-up
-  --prec N        show N digits, like the prec command
-  --set A=1       store a variable first, like the var command (--set "a=1 b=2" for several)
-  --const A=1     store a constant first, like the const command (may be repeated too)
-  --load NAME     load a save instead of the default one
-  --no-default    do not load the default save
-  --saves FILE    keep saves in FILE (the CALC_SAVES environment variable does too)
-
-  --help          show this help and exit
-
-Exit status: 0 on success, 1 if an expression or command failed (--pipe, --no-prompt),
-2 for a mistake on the command line.
-
-Examples
-  {prog} "2(5)" "sqrt(2)"                 evaluate two expressions, then prompt
-  {prog} --no-prompt "sin(pi/6)"          print 0.5 and exit
-  echo "1/3" | {prog} --pipe --prec 10    print 0.3333333333
-  {prog} --pipe --set x=4 < file.txt     evaluate every line of file.txt with x = 4
-"""
+exit status: 0 success, 1 a failed expression (--pipe, --no-prompt), 2 invalid usage"""
 
 
 def _parse_args(argv) -> dict:
-    opts = {'help': False, 'pipe': False, 'no_prompt': False, 'no_loop': False, 'no_ask': False,
+    opts = {'help': False, 'version': False, 'pipe': False, 'no_prompt': False, 'no_loop': False, 'no_ask': False,
             'color': None, 'no_default': False, 'prec': None, 'set': [], 'const': [], 'load': None,
             'saves': None, 'exprs': []}
     i, only_exprs = 0, False
@@ -5050,8 +5030,43 @@ def _parse_args(argv) -> dict:
     return opts
 
 
+def _version_text(prog: str) -> str:
+    """Program version, then what it runs on (useful in bug reports)."""
+    try:
+        backend = 'gmpy2 ' + __import__('gmpy2').version() if mpmath.libmp.BACKEND == 'gmpy' else 'no gmpy2'
+    except Exception:
+        backend = 'no gmpy2'
+    py = '.'.join(map(str, sys.version_info[:3]))
+    return f"{prog} {VERSION}\nPython {py}, mpmath {mpmath.__version__}, {backend}"
+
+
+def _enable_windows_ansi() -> bool:
+    """Ask a Windows console to understand color codes. False if it cannot (an old console)."""
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle   = kernel32.GetStdHandle(-11)                       # standard output
+        mode     = ctypes.c_ulong()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))   # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        return False
+
+
+def _windows_streams() -> None:
+    """Redirected input and output on Windows use the legacy code page: use UTF-8, so that characters
+    such as \u00d7 \u00f7 \u03c0 \u2192 neither fail nor get mangled."""
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            if stream is not None and not stream.isatty():
+                stream.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def _die(msg: str, status: int = 2) -> None:
-    prog = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else 'calculator.py'
+    prog = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else 'dcalc.py'
     sys.stderr.write(f"{prog}: {msg}\n")
     sys.exit(status)
 
@@ -5084,22 +5099,31 @@ def _main(argv=None) -> None:
     try:
         opts = _parse_args(argv)
     except _UsageError as ex:
-        prog = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else 'calculator.py'
+        prog = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else 'dcalc.py'
         sys.stderr.write(f"{prog}: {ex}\nTry '{prog} --help'.\n")
         sys.exit(2)
+    prog = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else 'dcalc.py'
     if opts['help']:
         _NO_COLOR = True
-        print(_cli_help(os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else 'calculator.py'))
+        print(_cli_help(prog))
+        return
+    if opts['version']:
+        _NO_COLOR = True
+        print(_version_text(prog))
         return
 
     pipe, once = opts['pipe'], opts['no_prompt']
     scripted   = pipe or once
     plain_out  = pipe or (once and not sys.stdout.isatty())      # scripted output should not carry color codes
     _NO_COLOR  = (plain_out or _NO_COLOR) if opts['color'] is None else not opts['color']
+    if os.name == 'nt':
+        _windows_streams()
+        if sys.stdout.isatty() and not _enable_windows_ansi() and opts['color'] is None:
+            _NO_COLOR = True                     # an old console that would show the color codes as text
     NO_ASK     = opts['no_ask'] or pipe
     NO_LOOP    = opts['no_loop'] or scripted
     if opts['saves']:
-        os.environ['CALC_SAVES'] = opts['saves']
+        os.environ['DCALC_SAVES'] = opts['saves']
     if pipe:
         try: sys.stdout.reconfigure(line_buffering=True)
         except (AttributeError, ValueError): pass

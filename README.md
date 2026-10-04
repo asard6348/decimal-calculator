@@ -1,44 +1,66 @@
-# Calculator
+# dcalc
 
-A calculator you run in the terminal. It works in decimal with 50 digits of
-precision and shows 30, so `0.1+0.2` is `0.3` and `1/3` goes on for a while.
-It also does complex numbers (with as many imaginary units as you like),
-derivatives, integrals, sets, and it can save your session.
+`dcalc` is an interactive, arbitrary-precision mathematical REPL (Read-Eval-Print Loop)
+built on Python and `mpmath`. It computes in decimal arithmetic and covers a range from
+elementary calculations to symbolic differentiation, numerical integration and
+computational physics.
 
-It is a single file: `calculator.py`.
+## Features
 
-## Install
+- **Decimal arithmetic** – 50 digits of precision, `0.1+0.2` is `0.3`
+- **Natural notation** – `2x**2+1`, `2(5)`, `2pi`, pasted `× ÷ π ²`
+- **Missing variables are asked for** – `x*2+y` prompts for `x` and `y`, then
+  allows changing them and showing the result again
+- **Complex numbers** – `sqrt(-4)` is `2i`, with optional extra imaginary units (`j`, `k`, ...)
+- **Calculus** – derivatives, integrals, limits, sums, roots
+- **Functions and sets** – `f="x**2+3x"`, `{1,2,3}`, `{>=0<10}`
+- **Saves** – variables, constants and functions can be saved and loaded
+- **Scriptable** – `--pipe` reads expressions from stdin
+- **Standalone executables** – no Python needed
 
-You need Python 3.9 or newer and mpmath:
+## Download
 
-```
+Executables for Windows, Linux and macOS are on the
+[Releases page](../../releases/latest).
+
+| System | File | Run |
+| --- | --- | --- |
+| Windows 10 or 11 | `dcalc-windows-x64.exe` | `.\dcalc-windows-x64.exe` |
+| Linux | `dcalc-linux-x64` | `chmod +x dcalc-linux-x64`, then `./dcalc-linux-x64` |
+| macOS (Apple Silicon) | `dcalc-macos-arm64` | `chmod +x dcalc-macos-arm64`, `xattr -d com.apple.quarantine dcalc-macos-arm64`, then `./dcalc-macos-arm64` |
+
+> Unsigned executables may trigger a SmartScreen or Gatekeeper warning.
+> On Windows: **More info**, then **Run anyway**.
+
+The file can be renamed to `dcalc` and put in a `PATH` directory. The name `dc` is
+best avoided: it is a different program on most Linux and macOS systems.
+Each release includes `SHA256SUMS.txt` with the checksums.
+
+## Run from source
+
+Python 3.9 or newer and mpmath are needed. gmpy2 is optional and can speed up
+heavy calculations.
+
+```bash
 pip install mpmath
+pip install gmpy2   # optional
+python dcalc.py
 ```
 
-`pip install gmpy2` is optional. It makes heavy calculations faster.
+## Getting started
 
-## Start it
+The program shows a `>>` prompt. An expression is evaluated when Enter is pressed.
+`help` prints the syntax and all functions. Ctrl+D quits (Windows: Ctrl+Z, then Enter).
 
-```
-python calculator.py
-```
+Expressions can also be given as arguments. They are evaluated before the prompt:
 
-You get a `>>` prompt and nothing else. Type `help` to see a short syntax
-reference, the other features, and the full list of functions. Press Ctrl+D to quit.
-
-You can also give expressions on the command line. They are evaluated first,
-then you get the prompt:
-
-```
-python calculator.py "2(5)" "sqrt(2)"
+```bash
+python dcalc.py "2(5)" "sqrt(2)"
 ```
 
-To use it in scripts, or to see all the options, read [Command line](#command-line)
-(`python calculator.py --help` shows the same list).
+Below, `python dcalc.py` stands for the program. With an executable, its file name is used instead.
 
 ## The basics
-
-Type an expression and press Enter.
 
 ```
 2+3*4                             → 14
@@ -54,10 +76,10 @@ Type an expression and press Enter.
 0x10                              → 16
 ```
 
-`^` and `**` both mean power. `//` and `%` round down, like in Python, so
+`^` and `**` both mean power. `//` and `%` round down, like in Python:
 `-7//2` is `-4` and `-7%3` is `2`. Division by zero is an error.
 
-Multiplication signs can be left out:
+Multiplication signs can be omitted:
 
 ```
 2(5)                              → 10
@@ -66,12 +88,12 @@ Multiplication signs can be left out:
 x=3;2x**2+1                       → 19
 ```
 
-A power binds tighter than the hidden multiplication, so `2x**2` is `2*(x**2)`.
-A hidden multiplication binds tighter than a division, so `1/2x` is `1/(2x)`.
-Use brackets if you want something else.
+A power binds tighter than implicit multiplication: `2x**2` is `2*(x**2)`.
+Implicit multiplication binds tighter than division: `1/2x` is `1/(2x)`.
+Brackets override both.
 
-Complex numbers work out of the box. `i` is the imaginary unit. (You can switch
-on more units, see [Imaginary units](#imaginary-units).)
+Complex numbers are built in, `i` being the imaginary unit. More units are described in
+[Imaginary units](#imaginary-units).
 
 ```
 sqrt(-4)                          → 2i
@@ -79,30 +101,27 @@ sqrt(-4)                          → 2i
 abs(3+4i)                         → 5
 ```
 
-You can paste text from other places. These characters are understood:
-`−` `×` `÷` `π` `²` `³`.
+Pasted text is accepted with these characters: `−` `×` `÷` `π` `²` `³`.
 
 ```
 5−3                               → 2
 2×3                               → 6
 ```
 
-There is no `5!`. Use `fact(5)`.
+There is no `5!`, `fact(5)` is used instead.
 
 ## Variables
 
 A variable is a single letter, or a word between underscores like `_speed_`.
-
-Set one inline, then write the expression after a semicolon:
+An inline assignment is followed by `;` and the expression:
 
 ```
 x=3;x^2                           → 9
 _speed_=5;_speed_*2               → 10
 ```
 
-If an expression uses a variable you have not set, the calculator asks for it.
-After the answer it stays in a small loop where you can change the values and
-see the result again:
+An expression with an unset variable asks for it. The answer is followed by a loop
+where the values can be changed and the result shown again:
 
 ```
 >> x*2+y
@@ -117,23 +136,20 @@ x> new
 >>
 ```
 
-In the loop you can:
+In the loop:
 
-- type a number or expression to change the variable shown in the prompt
-- type `x=...` to change another variable
-- press Enter on an empty line to see the result again
-- type `new` or `back` to leave
+- a number or expression changes the variable shown in the prompt
+- `x=...` changes another variable
+- an empty line shows the result again
+- `new` or `back` leaves
 
-A value you type at the prompt wins over an inline assignment. While you are
-being asked for the variables, `back` goes to the previous question and `new`
-drops the expression.
+A value typed at the prompt overrides an inline assignment. While the variables
+are asked for, `back` returns to the previous question and `new` drops the expression.
 
-What is remembered: functions and sets you assign stay for the whole session, and
-so do the variables and constants you store with `var` and `const`. Plain numbers
-do not, you are asked again on the next line. Use `var` for a number you want to
-keep and change, `const` for one that should not change by accident.
+Assigned functions and sets are remembered for the session, and so are variables and
+constants stored with `var` and `const`. Plain numbers are asked for again on the next line.
 
-Assignment operators work too: `+=` `-=` `*=` `/=` `//=` `**=` `|=`.
+Assignment operators: `+=` `-=` `*=` `/=` `//=` `**=` `|=`.
 
 ```
 x=10;x//=3;x                      → 3
@@ -142,7 +158,7 @@ f="x";f+=1;f(5)                   → 6
 
 ## Functions
 
-`help` lists every function. The ones you will probably use:
+`help` lists every function. Common ones:
 
 ```
 sqrt(2)                           → 1.41421356237309504880168872421
@@ -157,11 +173,10 @@ hypot(3,4)                        → 5
 clamp(15,0,10)                    → 10
 ```
 
-Trigonometry and its inverses (`sin`, `asin`, `sinh`, ...), `abs`, `floor`,
-`ceil`, `round`, `sign`, `gamma`, `erf`, `zeta`, Bessel functions and a lot
-more come from mpmath.
+Trigonometry and its inverses (`sin`, `asin`, `sinh`, ...), `abs`, `floor`, `ceil`,
+`round`, `sign`, `gamma`, `erf`, `zeta`, Bessel functions and more come from mpmath.
 
-Statistics take numbers or a set:
+Statistics accept numbers or a set:
 
 ```
 mean(1,2,3,4)                     → 2.5
@@ -183,8 +198,8 @@ divisors(28)                      → {1,2,4,7,14,28}
 ncr(5,2)                          → 10
 ```
 
-Others: `size(3,4)` is the length of the vector, `len(12.34)` counts the
-digits of a number, the letters of a string, the items of a set.
+`size(3,4)` is the length of a vector. `len` counts the digits of a number, the
+letters of a string or the items of a set.
 
 ```
 size(3,4)                         → 5
@@ -193,23 +208,23 @@ len(12.34)                        → 4
 
 ## Stored variables
 
-`var` keeps a variable for the whole session, whatever it holds: a number, a
-function, a set. A stored variable is never asked for again.
+`var` keeps a variable of any kind (number, function, set) for the session. A stored
+variable is never asked for.
 
 ```
-var k 1/3            store it
+var k 1/3            store
 var k=1/3            the same
-var a=1 b=2          store several, see below
-var k                show it
-var k+=1             change it (also *=, -=, ...)
-var                  list them all
+var a=1 b=2          store several
+var k                show
+var k+=1             change (also *=, -=, ...)
+var                  list all
 varrm a b            remove one or more
 varrmall             remove all variables (constants stay)
 ```
 
-To store several at once, write them as `name=value` one after the other. A
-value may contain spaces, the next `name=` starts the next variable, and a
-later one can use an earlier one. The same goes for `const`.
+Several variables are stored as `name=value` pairs. A value may contain spaces, the
+next `name=` starts the next item, and a later item can use an earlier one.
+`const` works the same way.
 
 ```
 >> var x=5 y=2+3
@@ -225,42 +240,39 @@ later one can use an earlier one. The same goes for `const`.
 + y = 10
 ```
 
-Changing a variable asks nothing. If the name belongs to a constant, `var`
-refuses and tells you to use `const`. `var(1,2,3)` is still the variance function.
+Changing a variable asks nothing. `var` refuses the name of a constant (`const` is used
+for those). `var(1,2,3)` is still the variance function.
 
-Functions and sets you assign (`f="x**2"`, `s={1,2}`) are stored as variables
-too, so `var` lists them and `varrm` and `varrmall` forget them.
+Assigned functions and sets (`f="x**2"`, `s={1,2}`) are variables too: `var` lists them,
+`varrm` and `varrmall` remove them.
 
 ## Constants
 
-Built in: `pi`, `e`, `tau`, `phi`, `euler`, `catalan`, `sqrt2`, `sqrt3`,
-`ln2`, `ln10`, `inf`, `ninf`, `nan`, `true`, `false`, and some physics ones:
-`light`, `planck`, `boltzmann`, `avogadro`, `echarge`, `grav`, `gravity`,
-`hbar`.
+Built in: `pi`, `e`, `tau`, `phi`, `euler`, `catalan`, `sqrt2`, `sqrt3`, `ln2`, `ln10`,
+`inf`, `ninf`, `nan`, `true`, `false`, and some physics ones: `light`, `planck`,
+`boltzmann`, `avogadro`, `echarge`, `grav`, `gravity`, `hbar`.
 
 ```
 tau                               → 6.28318530717958647692528676656
 light                             → 299792458
 ```
 
-Your own constants are kept for the session, are not removed by `varrmall`, and
-can be saved:
+Own constants last for the session, survive `varrmall`, and can be saved:
 
 ```
 const k 1/3          define
 const l=2 p=3        define several
-const k              show it
-const k+=1           change it (also *=, -=, ...)
-const                list them all
+const k              show
+const k+=1           change (also *=, -=, ...)
+const                list all
 constrm k l          remove one or more
-constex k            does it exist? (True/False)
+constex k            exists? (True/False)
 constin k            type and value
 constrmall           remove all
 ```
 
-If the name is already taken, `const` asks before replacing it. `constrm`,
-`constex` and `constin` take several names too; `constex` then prints one
-`name: True` or `name: False` per name.
+`const` asks before replacing an existing constant. `constrm`, `constex` and `constin`
+accept several names; `constex` then prints `name: True` or `name: False` for each.
 
 ```
 >> const l=20 p=30
@@ -273,24 +285,20 @@ If the name is already taken, `const` asks before replacing it. `constrm`,
 + p = 30
 ```
 
-These commands only know about constants. A function or set you made with
-`f="x**2"` or `s={1,2}` is not a constant, it is a variable: `varrm` forgets it.
+## Defining functions
 
-## Your own functions
-
-A function is a quoted expression. The free variables are its parameters.
+A function is a quoted expression. Its free variables are the parameters.
 
 ```
 f="x**2+3x";f(2)                  → 10
 f="x+y";run(f,2,3)                → 5
 ```
 
-You can do arithmetic with them: `f+g`, `f*2`, `f+=1`.
+Functions support arithmetic: `f+g`, `f*2`, `f+=1`.
 
 ### Derivatives
 
-`diff` gives a new function. It knows the usual functions and tells you when it
-does not know one.
+`diff` returns a new function. Unknown functions are reported.
 
 ```
 diff("sin(x)")                    → "cos(x)"
@@ -312,10 +320,9 @@ polyroots({1,-3,2})               → {1,2}
 taylor("exp(x)",0,3)              → {1,1,0.5,0.166666666666666666666666666667}
 ```
 
-`integrate` stops with an error if the integral does not seem to converge.
-`limit` and `nsum` use extrapolation. They are accurate for ordinary cases but
-not for very slow ones, like `ln(x)/x` at infinity. A divergent sum such as
-`1/x` is not detected.
+`integrate` reports an error when the integral does not appear to converge. `limit`
+and `nsum` use extrapolation: accurate for ordinary cases, not for very slow ones such
+as `ln(x)/x` at infinity. Divergent sums such as `1/x` are not detected.
 
 ## Sets
 
@@ -325,10 +332,10 @@ not for very slow ones, like `ln(x)/x` at infinity. A divergent sum such as
 {1,2,3}[4]                        → 2
 ```
 
-Counting starts at 0 and an index past the end wraps around.
+Indexing starts at 0 and an index past the end wraps around.
 
-On a finite set, `+` adds a member, `-` removes one, and `*`, `/`, `//`, `**`
-work on every member. `|` is union.
+On a finite set, `+` adds a member, `-` removes one, and `*`, `/`, `//`, `**` apply to
+every member. `|` is union.
 
 ```
 {0}+1                             → {0,1}
@@ -338,8 +345,8 @@ work on every member. `|` is union.
 sort({3,1,2})                     → {1,2,3}
 ```
 
-A set can also be a range: `{>=0<10}`, or two ranges: `{<0,>5}`. `+` and `*`
-move or stretch the range.
+A set can also be a range, `{>=0<10}`, or two ranges, `{<0,>5}`. `+` and `*` shift or
+scale the range.
 
 ```
 {>0}+1                            → {>1}
@@ -348,10 +355,10 @@ move or stretch the range.
 ~2.5                              → 2
 ```
 
-`~` rounds. On a number it gives a whole number, on a set it gives the whole
-numbers inside it. Halves go to the even number, the same as `round`.
+`~` rounds: a number becomes a whole number, a set becomes its whole-number members.
+Halves go to the even number, as in `round`.
 
-You can give single indexes their own value, or a rule for all indexes:
+Single indexes can have their own value, or a rule can cover all indexes:
 
 ```
 x={0};x[3]=7;x                    → {0,[3]=7}
@@ -360,10 +367,10 @@ x={[*2]=>=0};x[4]                 → 8
 x={[+1]=>7};x[8]                  → 2
 ```
 
-`{[*2]=>=0}` means index `i` gives `i*2`. In `{[+1]=>7}` the index wraps at 7
-first, so `i` gives `(i mod 7)+1`. With `>=0` the index is used as it is.
+`{[*2]=>=0}` means index `i` gives `i*2`. In `{[+1]=>7}` the index wraps at 7 first,
+so `i` gives `(i mod 7)+1`. With `>=0` the index is used as is.
 
-You can compare sets. `<=` and `<` mean subset.
+Sets are compared with `<=` and `<` (subset).
 
 ```
 {1,2}<={1,2,3}                    → True
@@ -381,17 +388,17 @@ len({1,2,3})                      → 3
 ```
 
 `==`, `!=`, `<`, `>`, `<=`, `>=` work on numbers, sets, strings and functions.
-`~=` rounds both sides to whole numbers first. `!` means not, and it is true
-for 0, an empty set and an empty string.
+`~=` rounds both sides to whole numbers first. `!` is not: true for 0, an empty set
+and an empty string.
 
-`(A):IF(c):(B)` gives `A` when the condition is true and `B` when it is not.
-You can give several conditions separated by commas, all of them must be true.
+`(A):IF(c):(B)` gives `A` if the condition is true, otherwise `B`. Several conditions
+can be separated by commas, all of them must be true.
 
 ## Repeating
 
-`repeat` runs steps a number of times. `until` runs them until a condition
-is true. A step is `x=...`, `x*=...`, or `x+=` alone, which adds 1 to a number
-or the next item to a set of numbers.
+`repeat` runs steps a number of times, `until` runs them until a condition is true.
+A step is `x=...`, `x*=...`, or `x+=` alone, which adds 1 to a number or the next item
+to a set of numbers.
 
 ```
 x=1;repeat(x*=2,10)               → 1024
@@ -399,28 +406,27 @@ x=0;until(x+=,x>9)                → 10
 x={0,1};until(x+=,x[10]==10)      → {0,1,2,3,4,5,6,7,8,9,10}
 ```
 
-`until` gives up after 100000 rounds.
+`until` stops after 100000 rounds.
 
 ## Text
 
-Text goes between square brackets. In front of an expression it is printed
-before the result:
+Text goes between square brackets. Before an expression, it is printed ahead of the
+result:
 
 ```
 [total: ]2+2                      → total: 4
 ```
 
-A text in square brackets can also be an index: `p[[work]]=5;p[[work]]`.
+Text in square brackets can also be an index: `p[[work]]=5;p[[work]]`.
 
 ## Imaginary units
 
-`i` is the imaginary unit, and you start with just that one. You can have more
-units, so that a number gets several independent imaginary parts. A unit is named
-by one letter or a word between underscores.
+`i` is the default imaginary unit. More units can be added, each giving a number an
+independent imaginary part. A unit is named by one letter or a word between underscores.
 
 ```
 img                  list the units
-img j k              add units; a unit you already have is switched on or off
+img j k              add units; an existing unit is switched on or off
 imgrm j k            remove units
 imgrmall             remove all units, i too
 ```
@@ -445,8 +451,8 @@ imgrmall             remove all units, i too
 -j
 ```
 
-Every unit squares to -1, and different units do not mix: `i*j` is a part of its
-own, written `ij`, and it squares to +1.
+Each unit squares to -1 and different units stay independent: `i*j` is a separate
+part, written `ij`, and it squares to +1.
 
 ```
 >> i*j
@@ -457,11 +463,10 @@ ij
 0
 ```
 
-Brackets are multiplied out for you, and `+ - * /` and whole-number powers work
-with any mix of units. Functions (`sqrt`, `exp`, `sin`, `abs`, `re`, `im`,
-non-whole powers...) take numbers with one unit at a time, because they are
-defined for ordinary complex numbers. `a+b*u` with any single unit `u` is
-treated as the complex number `a+b*i`, so for example:
+Brackets are multiplied out, and `+ - * /` and whole-number powers work with any mix
+of units. Functions (`sqrt`, `exp`, `sin`, `abs`, `re`, `im`, non-whole powers, ...)
+accept one unit at a time, since they are defined for ordinary complex numbers:
+`a+b*u` with a single unit `u` is treated as `a+b*i`.
 
 ```
 >> sqrt(3+4j)
@@ -472,14 +477,14 @@ treated as the complex number `a+b*i`, so for example:
 -1
 ```
 
-Mixing two units inside one function, like `sin(i+j)`, is an error. Dividing by a
-number that has no inverse (like `1+i*j`) is an error too.
+Two units in one function call, like `sin(i+j)`, are an error, and so is dividing by
+a number without an inverse (like `1+i*j`).
 
 ### On, off and removed
 
-Giving a name you already have to `img` switches that unit off, or on again. An
-unit that is off stays in the list, but its name is a normal name again. `imgrm`
-takes a unit out of the list completely.
+`img` with an existing name switches that unit off, or on again. A unit that is off
+stays listed, and its name is an ordinary name again. `imgrm` removes a unit from
+the list.
 
 ```
 >> img k
@@ -493,9 +498,9 @@ takes a unit out of the list completely.
 + j  (on)
 ```
 
-The first unit in the list that is on is the **main** unit. A real negative root
-gives the main unit, so `sqrt(-4)` is `2i` now. Switch `i` off and `j` takes over.
-Numbers you have stored keep their meaning when that happens.
+The first unit in the list that is on is the **main** unit. Real negative roots give
+the main unit, so `sqrt(-4)` is `2i`. If `i` is switched off, `j` takes over. Stored
+numbers keep their meaning.
 
 ```
 >> sqrt(-4)
@@ -508,152 +513,105 @@ Numbers you have stored keep their meaning when that happens.
 + i  (unit on)
 ```
 
-With no unit left on, `sqrt(-4)` is an error. A unit cannot share its name with
-a variable, a constant, or a built-in name (`e`, `pi`...): remove the variable
-first, or pick another name.
+With no unit on, `sqrt(-4)` is an error. A unit name cannot be taken by a variable, a
+constant or a built-in (`e`, `pi`, ...).
 
-The units, their order and their on/off state are saved and loaded with `save`
-and `load`.
+Units, their order and their on/off state are stored by `save`.
 
 ## Commands
 
-| Command | What it does |
+| Command | Effect |
 | --- | --- |
-| `help` | syntax reference, features and all functions |
+| `help` | syntax, features and all functions |
 | `new` | leave the current question or loop |
-| `back` | go back one question |
-| `img ...` | your imaginary units: `img`, `imgrm`, `imgrmall`, see above |
-| `prec 50` | show 50 digits (the calculator uses 20 more inside), `prec` alone shows the setting |
-| `var ...` | your variables: `var`, `varrm`, `varrmall`, see above |
-| `const ...` | your own constants: `const`, `constrm`, `constex`..., see above |
-| `save`, `load` and friends | see below |
+| `back` | previous question |
+| `prec 50` | display 50 digits (20 more are used internally), `prec` alone shows the setting |
+| `var ...` | variables: `var`, `varrm`, `varrmall` |
+| `const ...` | constants: `const`, `constrm`, `constex`, `constin`, `constrmall` |
+| `img ...` | imaginary units: `img`, `imgrm`, `imgrmall` |
+| `save`, `load`, ... | see Saving |
 
 ## Saving
 
 ```
-save work            save variables, functions, sets, constants and the imaginary units
+save work            save variables, functions, sets, constants and imaginary units
 load work
-saves                list them, a * marks the default one
+saves                list, * marks the default one
 saverm work          delete one
 savesrmall           delete all
 saveren work newname   rename
-savedefault work     load this one every time the program starts
-savedefault          save the current state as "default" and use it at start
+savedefault work     load this one at every start
+savedefault          save the current state as "default" and load it at every start
 ```
 
-The saves are written to `calculator_saves.json` in the folder you start
-the program from. The file is created the first time you save. Set the
-environment variable `CALC_SAVES` to use another path.
+Saves are written to `dcalc_saves.json` in the current directory, created on the first
+save. `DCALC_SAVES` sets another path.
 
 ## Command line
 
 ```
-python calculator.py [options] [--] [expression ...]
+python dcalc.py [options] [--] [expression ...]
 ```
 
-An argument is an option only if it is in the lists below, so an expression such
-as `-7//2` can be given as it is. If you want to be sure, put `--` before the
-expressions.
+Only the options below are options, so `-7//2` and `-h` are expressions. `--` ends the
+options.
 
-### Modes
-
-| Option | What it does |
+| Option | Effect |
 | --- | --- |
-| `--pipe` | Script mode. Also reads expressions from standard input, one per line, and prints only the results: no prompt, no colors, no questions. Errors go to standard error. Empty lines and lines starting with `#` are skipped. |
-| `--no-prompt` | Evaluates the expressions on the command line, then exits instead of showing the `>>` prompt. There is no variable loop either. |
-| `--no-loop` | After an answer, does not stay in the variable loop (the `x>` prompt), see [Variables](#variables). |
-| `--no-ask` | Never asks for a missing value: it is an error instead. `const` replaces an existing constant without asking. |
+| `--pipe` | read expressions from stdin, one per line (`#` lines and empty lines are skipped); print results only: no prompt, colors or questions, errors to stderr; implies `--no-ask` and `--no-loop` |
+| `--no-prompt` | exit after the given expressions; implies `--no-loop` |
+| `--no-loop` | skip the variable loop (`x>`) after an answer |
+| `--no-ask` | fail on a missing value instead of asking; `const` replaces without asking |
+| `--no-color`, `--no-colors` | colors off |
+| `--color` | colors on, overriding `NO_COLOR` and `--pipe` |
+| `--prec N` | display N digits |
+| `--set A=1` | store a variable first (`--set "a=1 b=2"` for several) |
+| `--const A=1` | store a constant first |
+| `--load NAME` | load a save instead of the default one |
+| `--no-default` | do not load the default save |
+| `--saves FILE` | save file, like `DCALC_SAVES` |
+| `--version` | version, and the Python, mpmath and gmpy2 in use |
+| `--help` | option list |
 
-`--pipe` means `--no-ask` and `--no-loop` as well. A value that is needed but
-missing is reported with the way to give it one:
+Colors are off for `--pipe`, and for `--no-prompt` when the output is not a terminal.
+The last of `--color` and `--no-color` wins. `NO_COLOR=1` also turns colors off.
 
-```
-$ echo "x*2" | python calculator.py --pipe
-'x' has no value. Give it one first: x=5;<expression>, var x 5, or --set x=5
-```
-
-### Look
-
-| Option | What it does |
-| --- | --- |
-| `--no-color`, `--no-colors` | Turns the colors off, like `NO_COLOR=1`. |
-| `--color` | Forces the colors on, even if `NO_COLOR` is set. |
-
-Without these, colors are on, except for `--pipe`, and for `--no-prompt` when
-the output goes to a file or a pipe. The last of `--color` and `--no-color`
-wins.
-
-### Start-up
-
-| Option | What it does |
-| --- | --- |
-| `--prec N` | Shows N digits, like the `prec` command. |
-| `--set A=1` | Stores a variable first, like `var`. Write `--set "a=1 b=2"` for several, or repeat the option. |
-| `--const A=1` | Stores a constant first, like `const`. |
-| `--load NAME` | Loads a save instead of the default one. |
-| `--no-default` | Does not load the default save. |
-| `--saves FILE` | Keeps the saves in FILE, like `CALC_SAVES`. |
-| `--help` | Shows the list of options and exits. |
-
-These steps run before the first expression, silently. If one fails, nothing
-else runs and the exit status is 2.
-
-### Examples
+`--prec`, `--set`, `--const` and `--load` run silently before the first expression.
+If one fails, nothing else runs.
 
 ```
-$ python calculator.py --no-prompt "sin(pi/6)" "2^64"
+$ python dcalc.py --no-prompt "sin(pi/6)" "2^64"
 0.5
 18446744073709551616
-$ echo "1/3" | python calculator.py --pipe --prec 10
+$ echo "1/3" | python dcalc.py --pipe --prec 10
 0.3333333333
 $ cat prices.txt
 # price with 21% tax
 x*1.21
-$ python calculator.py --pipe --set x=100 < prices.txt
+$ python dcalc.py --pipe --set x=100 < prices.txt
 121
-$ python calculator.py --no-prompt --set "a=2 b=3" --const k=10 "a*b+k"
+$ python dcalc.py --no-prompt --set "a=2 b=3" --const k=10 "a*b+k"
 16
 ```
 
-In `--pipe` mode a failing line does not stop the others. Its message goes to
-standard error, so the results stay clean:
+With `--pipe`, a failing line does not stop the others. Its message goes to stderr:
 
 ```
-$ printf '2+2\n1/0\nsqrt(16)\n' | python calculator.py --pipe 2>/dev/null
+$ printf '2+2\n1/0\nsqrt(16)\n' | python dcalc.py --pipe 2>/dev/null
 4
 4
 ```
 
-### Exit status
-
-| Status | Meaning |
-| --- | --- |
-| 0 | Everything worked. An interactive session always ends with 0. |
-| 1 | An expression or command failed (only for `--pipe` and `--no-prompt`). |
-| 2 | A mistake on the command line, or a start-up step failed. |
-
-## Settings
-
-- `NO_COLOR=1` or `--no-color` turns the colors off.
-- `CALC_SAVES=path` or `--saves path` sets where saves are kept.
-- `prec` and `img` are described above, `--prec` is the command-line form of `prec`.
+Exit status: 0 on success (an interactive session always ends with 0), 1 if an
+expression or command failed (`--pipe`, `--no-prompt`), 2 for invalid usage or a failed
+start-up option.
 
 ## Errors
 
-An error is printed in red with the expression the program saw in brackets
-under it:
+An error is printed in red, with the expression the program saw in brackets below:
 
 ```
-1/0                               → Division by zero.
-sqrt(                             → Unclosed '('.
-1.2.3                             → Invalid number '1.2.3'.
+1/0       → Division by zero.
+sqrt(     → Unclosed '('.
+1.2.3     → Invalid number '1.2.3'.
 ```
-
-## Tests
-
-```
-python test_calculator.py
-```
-
-It takes about two minutes. It runs several hundred calculations, checks the
-section order of `calculator.py`, and runs every `→` example in this file.
