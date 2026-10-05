@@ -219,6 +219,31 @@ size(3,4)                         → 5
 len(12.34)                        → 4
 ```
 
+Random numbers:
+
+```
+rand()                            → 0.0405648342555288823864623325831
+randrange(10)                     → 3
+randrange(5,10)                   → 7
+randrange(0,10,2)                 → 6
+randmatrix(2)                     → {{0.35684,0.96937},{0.92829,0.44172}}
+randmatrix(2,3,10,20)             → {{12.13,15.80,13.45},{17.98,11.02,19.56}}
+```
+
+`rand()` is a number from 0 up to, but not including, 1. `randrange` works like Python's:
+`randrange(stop)`, `randrange(start, stop)` or `randrange(start, stop, step)`, with whole numbers
+only. `stop` is never returned, and an empty range is an error.
+
+`randmatrix(m)` is a set of `m` rows with `m` random numbers each. `randmatrix(m,n)` has
+`m` rows of `n` numbers, and `randmatrix(m,n,lo,hi)` takes the numbers from `lo` up to `hi`
+instead of 0 to 1. A matrix is a set of sets, so a row or an item is reached with an index:
+
+```
+m=randmatrix(2,3);len(m)          → 2
+m=randmatrix(2,3);len(m[0])       → 3
+m=randmatrix(2);m[1][0]<1         → True
+```
+
 ## Stored variables
 
 `var` keeps a variable of any kind (number, function, set) for the session. A stored
@@ -369,7 +394,7 @@ scale the range.
 ```
 
 `~` rounds: a number becomes a whole number, a set becomes its whole-number members.
-Halves go to the even number, as in `round`.
+Ties follow the [rounding mode](#rounding), as in `round`: half even by default, so `~2.5` is `2`.
 
 Single indexes can have their own value, or a rule can cover all indexes:
 
@@ -401,7 +426,7 @@ len({1,2,3})                      → 3
 ```
 
 `==`, `!=`, `<`, `>`, `<=`, `>=` work on numbers, sets, strings and functions.
-`~=` rounds both sides to whole numbers first. `!` is not: true for 0, an empty set
+`~=` rounds both sides to whole numbers first (by the [rounding mode](#rounding)). `!` is not: true for 0, an empty set
 and an empty string.
 
 `(A):IF(c):(B)` gives `A` if the condition is true, otherwise `B`. Several conditions
@@ -531,6 +556,52 @@ constant or a built-in (`e`, `pi`, ...).
 
 Units, their order and their on/off state are stored by `save`.
 
+## Rounding
+
+`round()`, `~` and `~=` all use one rounding mode. `rounding` shows it, `rounding <mode>` changes it.
+The default is `half even`.
+
+```
+>> rounding
+Rounding: half even
+>> ~2.5
+2
+>> rounding half up
+Rounding → half up
+>> ~2.5
+3
+>> round(2.567,2)
+2.57
+```
+
+| Mode | Rounds to |
+| --- | --- |
+| `half even` | the nearest whole number, a tie goes to the even one (default) |
+| `half up` | the nearest whole number, a tie goes away from zero |
+| `half down` | the nearest whole number, a tie goes toward zero |
+| `up` | always away from zero |
+| `down` | always toward zero |
+| `05up` | away from zero if the last kept digit would be 0 or 5, otherwise toward zero |
+| `floor` | toward −infinity |
+| `ceiling` | toward +infinity |
+
+The result for a few numbers:
+
+| Mode | `~2.5` | `~3.5` | `~-2.5` | `~2.1` | `~-2.1` | `~5.1` |
+| --- | --- | --- | --- | --- | --- | --- |
+| `half even` | 2 | 4 | -2 | 2 | -2 | 5 |
+| `half up` | 3 | 4 | -3 | 2 | -2 | 5 |
+| `half down` | 2 | 3 | -2 | 2 | -2 | 5 |
+| `up` | 3 | 4 | -3 | 3 | -3 | 6 |
+| `down` | 2 | 3 | -2 | 2 | -2 | 5 |
+| `05up` | 2 | 3 | -2 | 2 | -2 | 6 |
+| `floor` | 2 | 3 | -3 | 2 | -3 | 5 |
+| `ceiling` | 3 | 4 | -2 | 3 | -2 | 6 |
+
+The mode applies to numbers, to complex numbers (each part) and to the members of a set.
+The digits shown in an answer (`prec`) and the functions `floor`, `ceil` and `int` do not use it.
+The mode is stored by `save`.
+
 ## Commands
 
 | Command | Effect |
@@ -539,6 +610,7 @@ Units, their order and their on/off state are stored by `save`.
 | `new` | leave the current question or loop |
 | `back` | previous question |
 | `prec 50` | display 50 digits (20 more are used internally), `prec` alone shows the setting |
+| `rounding ...` | rounding mode of `round`, `~` and `~=`: `rounding`, `rounding half up`, ... see Rounding |
 | `var ...` | variables: `var`, `varrm`, `varrmall` |
 | `const ...` | constants: `const`, `constrm`, `constex`, `constin`, `constrmall` |
 | `img ...` | imaginary units: `img`, `imgrm`, `imgrmall` |
@@ -547,7 +619,7 @@ Units, their order and their on/off state are stored by `save`.
 ## Saving
 
 ```
-save work            save variables, functions, sets, constants and imaginary units
+save work            save variables, functions, sets, constants, imaginary units and the rounding mode
 load work
 saves                list, * marks the default one
 saverm work          delete one

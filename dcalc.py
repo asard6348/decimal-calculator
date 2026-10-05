@@ -26,6 +26,7 @@ import inspect
 import io
 import json
 import os
+import random
 import re
 import sys
 import threading
@@ -258,9 +259,22 @@ def _from_mp_result(r):
     return dec(str(r))
 
 
+_ROUNDING_MODES = {
+    'half up':   decimal.ROUND_HALF_UP,
+    'half down': decimal.ROUND_HALF_DOWN,
+    'half even': decimal.ROUND_HALF_EVEN,
+    'up':        decimal.ROUND_UP,
+    'down':      decimal.ROUND_DOWN,
+    '05up':      decimal.ROUND_05UP,
+    'floor':     decimal.ROUND_FLOOR,
+    'ceiling':   decimal.ROUND_CEILING,
+}
+_rounding = ['half even']
+
+
 def _round_int(v):
-    """The one rounding rule for whole numbers (used by round(), ~ and ~=): ties go to the even neighbour."""
-    return v.to_integral_value(rounding=decimal.ROUND_HALF_EVEN)
+    """The one rounding rule for whole numbers (used by round(), ~ and ~=): set by the rounding command, half even by default."""
+    return v.to_integral_value(rounding=_ROUNDING_MODES[_rounding[0]])
 
 
 def _op_pow(a, b):
@@ -1968,12 +1982,18 @@ def _set_anchor_hi(base, offset):
     return U + off
 
 
+def _round_mp(x):
+    if not mpmath.isfinite(x):
+        return x
+    return mpmath.mpf(str(_round_int(_to_dec(x))))
+
+
 def _round_obj(v):
     """Prefix '~': round a number, or turn a set into its rounded/integer set."""
     if isinstance(v, ImgNum):
         return _img_norm({m: _round_int(c) for m, c in v.p.items()})
     if isinstance(v, mpmath.mpc):
-        return mpmath.mpc(mpmath.nint(v.real), mpmath.nint(v.imag))
+        return mpmath.mpc(_round_mp(v.real), _round_mp(v.imag))
     if isinstance(v, dec):
         return v if (v.is_infinite() or v.is_nan()) else _round_int(v)
     if isinstance(v, SetObj):
@@ -2247,7 +2267,7 @@ def _int(x):  return dec(int(x))
 def _round(x, n=dec(0)):
     if isinstance(x, ImgNum):
         return _img_norm({m: _round(c, n) for m, c in x.p.items()})
-    return x.quantize(dec(10) ** -int(n), rounding=decimal.ROUND_HALF_EVEN)
+    return x.quantize(dec(10) ** -int(n), rounding=_ROUNDING_MODES[_rounding[0]])
 
 
 def _hydrogen_e(n):
@@ -2629,6 +2649,32 @@ def _rev(s):
     raise CalcError("rev(): a finite set expected.")
 
 
+def _randmatrix(m, n=None, lo=None, hi=None):
+    rows = _int_arg(m, 'randmatrix')
+    cols = rows if n is None else _int_arg(n, 'randmatrix')
+    if rows < 1 or cols < 1:
+        raise CalcError("randmatrix(): positive whole numbers expected.")
+    if rows * cols > 1_000_000:
+        raise CalcError("randmatrix(): limit is 1,000,000 values.")
+    lo = dec(0) if lo is None else _nums([lo], 'randmatrix')[0]
+    hi = dec(1) if hi is None else _nums([hi], 'randmatrix')[0]
+    span = hi - lo
+    return SetObj('list', values=[SetObj('list', values=[lo + _from_mp_result(mpmath.rand()) * span for _ in range(cols)])
+                                  for _ in range(rows)])
+
+
+def _randrange(*a):
+    if not 1 <= len(a) <= 3:
+        raise CalcError("randrange() takes 1 to 3 arguments: randrange(stop), randrange(start, stop) or randrange(start, stop, step)")
+    v = [_int_arg(x, 'randrange') for x in a]
+    if len(v) == 3 and v[2] == 0:
+        raise CalcError("randrange(): step must not be zero.")
+    try:
+        return dec(random.randrange(*v))
+    except ValueError:
+        raise CalcError("randrange(): empty range.") from None
+
+
 def _repeat_not_toplevel(*_):
     raise CalcError("repeat() must be a top-level call: repeat(step, ..., ticks)")
 
@@ -2845,7 +2891,8 @@ for _n, _f in {'sum': _sum, 'prod': _prod, 'mean': _mean, 'median': _median,
                'primes': _primes, 'divisors': _divisors, 'npr': _npr, 'sq': _sq, 'cube': _cube,
                'log2': _log2, 'clamp': _clamp, 'lerp': _lerp, 'mod': _op_mod, 'iff': _iff,
                'abs': _abs, 'max': _max, 'min': _min,
-               'dist': _dist, 'digsum': _digsum, 'sort': _sort, 'rev': _rev}.items():
+               'dist': _dist, 'digsum': _digsum, 'sort': _sort, 'rev': _rev,
+               'randmatrix': _randmatrix, 'randrange': _randrange}.items():
     dco[_n] = _f
 
 
@@ -3057,7 +3104,7 @@ def _write_saves(data: dict) -> None:
 def _snapshot() -> dict:
     return {'vars':   {_demangle_text(k): _enc(v) for k, v in _user_vars.items()},
             'consts': {_demangle_text(k): _enc(v) for k, v in _const_vars.items()},
-            'settings': {'prec': DISPLAY_PREC,
+            'settings': {'prec': DISPLAY_PREC, 'rounding': _rounding[0],
                          'units': [[_disp_name(_UNIT_KEYS[u]), u not in _UNIT_OFF] for u in _UNIT_LIST]}}
 
 
@@ -3099,6 +3146,7 @@ def _restore_all(snap: dict) -> int:
     _user_vars.clear();  _user_vars.update(vars_)
     _const_vars.clear(); _const_vars.update(consts)
     if 'prec' in st and int(st['prec']) != DISPLAY_PREC: actions(f"prec {int(st['prec'])}")
+    if st.get('rounding') in _ROUNDING_MODES: _rounding[0] = st['rounding']
     return len(vars_) + len(consts)
 
 
@@ -3465,12 +3513,23 @@ def _cmd_saveren(rest: str) -> None:
     _write_saves(data); print(f"{GREEN}renamed{RST} '{old}' → '{new}'")
 
 
+def _cmd_rounding(rest: str) -> None:
+    mode = ' '.join(rest.lower().split())
+    if not mode:
+        print(f"{GREEN}Rounding: {_rounding[0]}{RST}"); return
+    if mode not in _ROUNDING_MODES:
+        raise CalcError(f"rounding: unknown mode '{mode}'. Use: {', '.join(_ROUNDING_MODES)}.")
+    _rounding[0] = mode
+    print(f"{GREEN}Rounding → {mode}{RST}")
+
+
 _COMMANDS = {
     'const':       lambda r: _cmd_const(r),
     'constrm':     lambda r: _cmd_constrm(r),
     'constex':     lambda r: _cmd_constex(r),
     'constin':     lambda r: _cmd_constin(r),
     'constrmall':  lambda r: _cmd_constrmall(),
+    'rounding':    lambda r: _cmd_rounding(r),
     'img':         lambda r: _cmd_img(r),
     'imgrm':       lambda r: _cmd_imgrm(r),
     'imgrmall':    lambda r: _cmd_imgrmall(),
@@ -3554,7 +3613,7 @@ def hlp():
     ]))
     print(f"""
 {BOLD}Quick reference:{RST}
-  Commands:   help / new / back / prec <n> / img... / var... / const... / save... / load   (quit: Ctrl+D, on Windows Ctrl+Z then Enter)
+  Commands:   help / new / back / prec <n> / rounding <mode> / img... / var... / const... / save... / load   (quit: Ctrl+D, on Windows Ctrl+Z then Enter)
   Operators:  + - * / ** // %     (^ is the same as **)
   Variables:  single letters, or a word in underscores like _speed_
   Subscript:  x[1] / _work_[0] / {{0,1}}[0]
@@ -3569,6 +3628,7 @@ def hlp():
                    Params are the free variables in the expression.
                    Example:  f="sin(x)"
   {GREEN}f(val)         {RST}  evaluate Lambda f at val.  f(pi/2) → 1
+  {GREEN}"expr"(val)    {RST}  a quoted expression can be called directly:  "x**2"(3) → 9,  '2+2'() → 4
   {GREEN}run(f, val[, val2…]){RST}
                    evaluate Lambda f at the given values (cycled across params if fewer
                    values than params). f may be omitted to reuse the last unassigned
@@ -3611,7 +3671,20 @@ def hlp():
 
 {BOLD}Sets:{RST}
   {GREEN}range(a,b)    {RST}  continuous set {{>=a<b}};  {GREEN}~range(0,3){RST} → {{0,1,2}}
-  {GREEN}~x            {RST}  round a number, or turn a set into its whole-number members
+  {GREEN}~x            {RST}  round a number, or turn a set into its whole-number members (see rounding)
+
+{BOLD}Rounding{RST} (round(), ~ and ~= follow one mode; display rounding and floor/ceil are not affected):
+  {GREEN}rounding{RST}          show the mode      {GREEN}rounding <mode>{RST}   set it (kept by save)
+  half even   ties to the even number (default)      half up    ties away from zero
+  half down   ties toward zero                       up         always away from zero
+  down        always toward zero                     floor      toward -infinity
+  ceiling     toward +infinity                       05up       away from zero if the last kept digit would be 0 or 5, else toward zero
+
+{BOLD}Random numbers:{RST}
+  {GREEN}rand()         {RST}  random number from 0 up to (not including) 1
+  {GREEN}randrange(stop){RST}  random whole number from 0 to stop-1;  {GREEN}randrange(start, stop[, step]){RST} works like Python's
+  {GREEN}randmatrix(m[, n[, lo, hi]]){RST}
+                   m rows of n random numbers (n = m, range [lo, hi) = [0, 1) by default) as a set of rows:  randmatrix(2) → {{{{0.12,0.83}},{{0.5,0.07}}}}
 
 {BOLD}Loops (top-level calls):{RST}
   {GREEN}repeat(step, .., n){RST}   run every step n times. A step is  x=..  x+=..  x+=  or a bare
@@ -3951,13 +4024,15 @@ def _needs_mul(prev, curr, prev_name, v_dict):
             insert = False
         elif isinstance(v_dict.get(prev_name), Lambda):
             insert = False
+    if insert and curr.string == '(' and prev.type == _TOK_STRING:
+        insert = False          # '2+2'() / "x+1"(3): call the quoted expression
     return insert
 
 
 def _is_naked(prev_last, curr_first, v_dict):
     if curr_first.string not in ('(', '[', '{'):
         return False
-    if prev_last.type != tokenize.NAME:
+    if prev_last.type != tokenize.NAME and not (prev_last.type == _TOK_STRING and curr_first.string == '('):
         return False
     return not _needs_mul(prev_last, curr_first, prev_last.string, v_dict)
 
@@ -4118,7 +4193,7 @@ def _group_tokens(tokens: list, lo: int, hi: int, v_dict: dict, in_subscript: bo
                 inner = _group_tokens(tokens, i + 1, j - 1, v_dict,
                                        in_subscript=(open_ch == '['),
                                        in_str_call=child_in_str)
-            if open_ch == '(' and depth == 0 and not inner.strip() and not (atoms and atoms[-1][2].type == tokenize.NAME):
+            if open_ch == '(' and depth == 0 and not inner.strip() and not (atoms and atoms[-1][2].type in (tokenize.NAME, _TOK_STRING)):
                 raise CalcError("Empty parentheses.")
             atoms.append((open_ch + inner + close_ch, t, tokens[j - 1]))
             i = j
