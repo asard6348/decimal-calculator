@@ -1727,11 +1727,10 @@ class SetObj:
 
     def _arith(self, other, op, flipped=False):
         if isinstance(other, SetObj):
-            if op in ('+', '|'):
+            if op == '+':
                 return self._union(other)
-            if op == '-' and self.kind != 'ineq' and other.kind != 'ineq':
-                raw_other = {SetObj._unwrap(x) for x in other.values}
-                return self.copy(values=[x for x in self.values if SetObj._unwrap(x) not in raw_other])
+            if op == '-':
+                return self._minus(other)
             return NotImplemented
         scalar = SetObj._to_scalar(other)
         if scalar is None:
@@ -1754,7 +1753,7 @@ class SetObj:
                     if v is not None:
                         out.append((v, True, v, True, None))
                 return out
-            return SetObj('ineq', clauses=to_clauses(self) + to_clauses(other))
+            return SetObj('ineq', clauses=_merge_clauses(to_clauses(self) + to_clauses(other)))
         raw = [SetObj._unwrap(x) for x in self.values]
         merged = list(self.values)
         for x in other.values:
@@ -1776,10 +1775,82 @@ class SetObj:
     def __rfloordiv__(self, o): return self._arith(o, '//', True)
     def __pow__(self, o):       return self._arith(o, '**')
     def __rpow__(self, o):      return self._arith(o, '**', True)
-    def __or__(self, o):
-        return self._union(o) if isinstance(o, SetObj) else NotImplemented
-    def __ror__(self, o):
-        return self._union(o) if isinstance(o, SetObj) else NotImplemented
+    def __and__(self, o):
+        return self._both(o) if isinstance(o, SetObj) else NotImplemented
+    def __rand__(self, o):
+        return self._both(o) if isinstance(o, SetObj) else NotImplemented
+
+    def __abs__(self):
+        if self.kind == 'zeros2d' or self.modificators:
+            raise CalcError("abs() does not work with a set that has index rules.")
+        if self.kind != 'ineq':
+            seen, out = [], []
+            for x in self.values:
+                r = _abs(SetObj._unwrap(x))
+                if r not in seen:
+                    seen.append(r); out.append(r)
+            return self.copy(values=out, overrides={k: _abs(SetObj._unwrap(v)) for k, v in self.overrides.items()})
+        out = []
+        for lo, lo_i, hi, hi_i, f in self.clauses:
+            if lo >= 0:
+                out.append((lo, lo_i, hi, hi_i, f))
+            elif hi <= 0:
+                out.append((-hi, hi_i, -lo, lo_i, f))
+            else:
+                a, b = -lo, hi
+                m, m_i = (a, lo_i) if a > b else ((b, hi_i) if b > a else (a, lo_i or hi_i))
+                out.append((dec(0), True, m, m_i, f))
+        return SetObj('ineq', clauses=_merge_clauses(out))
+
+    def _parts(self):
+        """The continuous clauses of this set, with single numbers as one-point clauses."""
+        if self.kind == 'ineq':
+            return list(self.clauses)
+        out = []
+        for x in self.values:
+            v = SetObj._unwrap(x)
+            v = v if isinstance(v, dec) else SetObj._to_scalar(v)
+            if v is not None:
+                out.append((v, True, v, True, None))
+        return out
+
+    def _minus(self, other):
+        if self.kind == 'zeros2d' or other.kind == 'zeros2d' or self.modificators or other.modificators:
+            raise CalcError("A set with index rules cannot be subtracted.")
+        if self.kind != 'ineq' and other.kind != 'ineq':
+            raw_other = {SetObj._unwrap(x) for x in other.values}
+            return self.copy(values=[x for x in self.values if SetObj._unwrap(x) not in raw_other])
+        cut = _merge_clauses(other._parts())
+        if self.kind != 'ineq':
+            return self.copy(values=[x for x in self.values
+                                     if not (isinstance(SetObj._unwrap(x), dec) and _in_clauses(SetObj._unwrap(x), cut))])
+        pieces = list(self.clauses)
+        for d in cut:
+            nxt = []
+            for c in pieces:
+                nxt.extend(_clause_minus(c, d))
+            pieces = nxt
+        return SetObj('ineq', clauses=_merge_clauses(pieces)) if pieces else SetObj('list', values=[])
+
+    def _both(self, other):
+        if self.kind == 'zeros2d' or other.kind == 'zeros2d' or self.modificators or other.modificators:
+            raise CalcError("A set with index rules cannot be intersected.")
+        if self.kind != 'ineq' and other.kind != 'ineq':
+            raw_other = {SetObj._unwrap(x) for x in other.values}
+            return self.copy(values=[x for x in self.values if SetObj._unwrap(x) in raw_other])
+        if self.kind != 'ineq' or other.kind != 'ineq':
+            fin, con = (self, other) if self.kind != 'ineq' else (other, self)
+            cl = _merge_clauses(con.clauses)
+            return fin.copy(values=[x for x in fin.values
+                                    if isinstance(SetObj._unwrap(x), dec) and _in_clauses(SetObj._unwrap(x), cl)])
+        out = []
+        for a in _merge_clauses(self.clauses):
+            for b in _merge_clauses(other.clauses):
+                lo, lo_i = (a[0], a[1]) if a[0] > b[0] else ((b[0], b[1]) if b[0] > a[0] else (a[0], a[1] and b[1]))
+                hi, hi_i = (a[2], a[3]) if a[2] < b[2] else ((b[2], b[3]) if b[2] < a[2] else (a[2], a[3] and b[3]))
+                if lo < hi or (lo == hi and lo_i and hi_i):
+                    out.append((lo, lo_i, hi, hi_i, a[4] if a[4] is not None else b[4]))
+        return SetObj('ineq', clauses=_merge_clauses(out)) if out else SetObj('list', values=[])
 
     def __getitem__(self, key):
         if self.kind == 'zeros2d':
@@ -1927,7 +1998,7 @@ def _make_set_ineq(*clauses):
     for lo, lo_i, hi, hi_i, override in parsed:
         if lo > hi or (lo == hi and not (lo_i and hi_i)):
             raise CalcError("Set clause has no valid range (e.g. '>10<0' \u2014 did you mean a comma for union, like '>10,<0'?)")
-    return SetObj('ineq', clauses=parsed)
+    return SetObj('ineq', clauses=_merge_clauses(parsed))
 
 
 def _make_set_list(*vals):
@@ -1950,24 +2021,124 @@ def _zeros(*args):
 
 
 def _range_set(*args):
-    """range(n) / range(a, b): the continuous set {>=a<b} (use ~range(..) for its integers)."""
-    if len(args) == 1:
-        lo, hi = dec(0), args[0]
-    elif len(args) == 2:
-        lo, hi = args
+    """range(n) / range(a, b) / range(a, b, step): the finite set of numbers a, a+step, ... below b."""
+    if not 1 <= len(args) <= 3:
+        raise CalcError("range() takes 1 to 3 arguments: range(stop), range(start, stop) or range(start, stop, step)")
+    vals = [_to_dec(a) if isinstance(a, mpmath.mpf) else a for a in args]
+    if not all(isinstance(v, dec) and v.is_finite() for v in vals):
+        raise CalcError("range() needs finite numbers.")
+    if len(vals) == 1:
+        lo, hi, step = dec(0), vals[0], dec(1)
+    elif len(vals) == 2:
+        lo, hi, step = vals[0], vals[1], dec(1)
     else:
-        raise CalcError("range() takes 1 or 2 arguments: range(n) or range(start, stop)")
-    return _make_set_ineq(('>=', lo, '<', hi, None))
+        lo, hi, step = vals
+    if step == 0:
+        raise CalcError("range(): step must not be zero.")
+    if abs((hi - lo) / step) > 1000000:
+        raise CalcError("range(): too many members.")
+    out, v = [], lo
+    while (v < hi) if step > 0 else (v > hi):
+        out.append(v)
+        v += step
+    return SetObj('list', values=out)
 
 
 def _interval(*args):
+    """interval(b) / interval(a, b): every value between the edges, edges excluded; a third argument
+    names the ends the way mathematicians write them: "[]" "[)" "(]" "()"."""
+    ends = '()'
+    if args and isinstance(args[-1], (Lambda, str)):
+        ends = args[-1].expr if isinstance(args[-1], Lambda) else args[-1]
+        ends = ends.strip()
+        args = args[:-1]
+        if ends not in ('[]', '[)', '(]', '()'):
+            raise CalcError('interval(): the ends are "[]", "[)", "(]" or "()", for example interval(0, 5, "[)").')
     if len(args) == 1:
         lo, hi = dec(0), args[0]
     elif len(args) == 2:
         lo, hi = args[0], args[1]
     else:
-        raise CalcError("interval() takes 1 or 2 arguments: interval(end) or interval(start, end)")
-    return _make_set_ineq(('>', lo, '<', hi, None))
+        raise CalcError("interval() takes 1 or 2 numbers and optionally the ends: interval(end), interval(start, end, \"[)\")")
+    return _make_set_ineq(('>=' if ends[0] == '[' else '>', lo, '<=' if ends[1] == ']' else '<', hi, None))
+
+
+def _clause_minus(c, d):
+    """The parts of the clause c left after removing the clause d."""
+    lo, lo_i, hi, hi_i, f = c
+    dlo, dlo_i, dhi, dhi_i, _ = d
+    ilo, ilo_i = (lo, lo_i) if lo > dlo else ((dlo, dlo_i) if dlo > lo else (lo, lo_i and dlo_i))
+    ihi, ihi_i = (hi, hi_i) if hi < dhi else ((dhi, dhi_i) if dhi < hi else (hi, hi_i and dhi_i))
+    if not (ilo < ihi or (ilo == ihi and ilo_i and ihi_i)):
+        return [c]
+    out = []
+    if lo < dlo or (lo == dlo and lo_i and not dlo_i):
+        out.append((lo, lo_i, dlo, not dlo_i, f))
+    if hi > dhi or (hi == dhi and hi_i and not dhi_i):
+        out.append((dhi, not dhi_i, hi, hi_i, f))
+    return out
+
+
+def _merge_clauses(clauses):
+    """Sort continuous clauses and join the ones that overlap or touch (so {>0<5}+{>=5<9} is {>0<9})."""
+    items = sorted(clauses, key=lambda c: (c[0], 0 if c[1] else 1, c[2]))
+    out = []
+    for cl in items:
+        if out:
+            lo, lo_i, hi, hi_i, f = out[-1]
+            nlo, nlo_i, nhi, nhi_i, nf = cl
+            joined = nlo < hi or (nlo == hi and (hi_i or nlo_i))
+            if joined and (f is None or nf is None or f == nf):
+                if nhi > hi or (nhi == hi and nhi_i):
+                    hi, hi_i = nhi, nhi_i
+                out[-1] = (lo, lo_i, hi, hi_i, f if f is not None else nf)
+                continue
+        out.append(cl)
+    return out
+
+
+def _in_clauses(v, clauses):
+    for lo, lo_i, hi, hi_i, _ in clauses:
+        if (v >= lo if lo_i else v > lo) and (v <= hi if hi_i else v < hi):
+            return True
+    return False
+
+
+def _member(a, b):
+    """a:b  is a an element of the set b, or (for a set a) a subset of it."""
+    if not isinstance(b, SetObj):
+        raise CalcError("':' needs a set on the right, for example 5:{>=0<20}")
+    if b.kind == 'zeros2d' or b.modificators:
+        raise CalcError("':' does not work with a set that has index rules.")
+
+    def has(v):
+        if isinstance(v, mpmath.mpf):
+            v = _to_dec(v)
+        if b.kind == 'ineq':
+            return isinstance(v, dec) and _in_clauses(v, b.clauses) or any(
+                SetObj._unwrap(x) == v for x in b.overrides.values())
+        for x in list(b.values) + list(b.overrides.values()):
+            if SetObj._unwrap(x) == v:
+                return True
+        return False
+
+    if isinstance(a, SetObj):
+        if a.kind == 'zeros2d' or a.modificators:
+            raise CalcError("':' does not work with a set that has index rules.")
+        if a.kind == 'ineq':
+            if b.kind != 'ineq':
+                return _Bool(all(c[0] == c[2] and has(c[0]) for c in a.clauses))
+            mb = _merge_clauses(b.clauses)
+            for lo, lo_i, hi, hi_i, _ in a.clauses:
+                if not any((lo > blo or (lo == blo and (blo_i or not lo_i))) and
+                           (hi < bhi or (hi == bhi and (bhi_i or not hi_i)))
+                           for blo, blo_i, bhi, bhi_i, _f in mb):
+                    return _Bool(False)
+            return _Bool(True)
+        return _Bool(all(has(SetObj._unwrap(x)) for x in a.values))
+    if isinstance(a, ImgNum) or isinstance(a, mpmath.mpc):
+        raise CalcError("':' needs a real number or a set on the left.")
+    return _Bool(has(a))
 
 
 def _set_anchor_lo(base, offset):
@@ -2605,6 +2776,8 @@ def _npr(n, r):
 
 
 def _abs(x):
+    if isinstance(x, SetObj):
+        return x.__abs__()
     if isinstance(x, ImgNum):
         return _img_via_unit(_abs, (x,), 'abs')
     if isinstance(x, mpmath.mpc):
@@ -5791,7 +5964,7 @@ def _cmd_imgrmall() -> None:
     print(f"{DEL}- removed {n} unit{'s' if n != 1 else ''}{RST}")
 
 
-_ASSIGN_RE = re.compile(_NAME_TOK_RE + r'\s*(?:\*\*|//|[+\-*/|])?=(?!=)')
+_ASSIGN_RE = re.compile(_NAME_TOK_RE + r'\s*(?:\*\*|//|[+\-*/|&%^])?=(?!=)')
 
 
 def _split_items(rest: str) -> list:
@@ -5816,7 +5989,7 @@ def _split_items(rest: str) -> list:
 
 def _split_name_value(rest: str):
     """'k', 'k 5', 'k=5' or 'k+=5' -> (name, operator or None, value text), or None if there is no valid name."""
-    m = re.match(rf'^{_NAME_TOK_RE}\s*(\*\*|//|[+\-*/|])?=\s*(.*)$', rest)
+    m = re.match(rf'^{_NAME_TOK_RE}\s*(\*\*|//|[+\-*/|&%^])?=\s*(.*)$', rest)
     if m:
         return m.group(1), m.group(2), m.group(3).strip()
     m = re.match(rf'^{_NAME_TOK_RE}(?:\s+(.*))?$', rest)
@@ -6190,15 +6363,26 @@ def hlp():
   {GREEN}(A):IF(c,..):(B){RST}  A if every condition is true, otherwise B
 
 {BOLD}Assignment:{RST}
-  {GREEN}x=..  x+=..  x-=..  x*=..  x/=..  x//=..  x**=..  x|=..{RST}   work on numbers, functions and sets
+  {GREEN}x=..  x+=..  x-=..  x*=..  x/=..  x//=..  x**=..  x^=..  x%=..  x&=..{RST}   work on numbers, functions and sets
   {GREEN}{{0}}+1 → {{0,1}}{RST}   on a finite set + and - add/remove a member; * / // ** map over members
   {GREEN}{{>0}}+1 → {{>1}}{RST}   on a continuous set the bounds shift/scale
   {GREEN}x[1]=2        {RST}  pin index 1 of set x:  x={{0}}; x[1]=2; x → {{0,[1]=2}}
   {GREEN}{{[10]=0,[[k]]=1}}{RST}  index/string-key entries in a literal (last duplicate wins)
   {GREEN}{{[*2]=>=0}}     {RST}  index rule: x[i] = i*2 ;  {{[+1]=>7}} → (i mod 7)+1  (N=0: no wrap)
 
+{BOLD}Symbols{RST} (typed or pasted, turned into plain input):
+  {GREEN}x² x³ 2¹⁰ x⁻¹{RST}  powers    {GREEN}½ ¼ ¾ ⅛ 2½{RST}  fractions, mixed numbers    {GREEN}√ ∛ ∜{RST}  roots: √16, √(9+16)
+  {GREEN}× ÷ − π τ φ ∞ ° ‰ %{RST}   sin(30°) is 0.5; 5% is 0.05, 7%3 is still the remainder     {GREEN}⌊x⌋ ⌈x⌉{RST}   floor, ceil     {GREEN}≤ ≥ ≠ ≈{RST}   <= >= != ~=
+  {GREEN}∈ ⊂ ⊆ ∪ ∖ ∩ ∅{RST}   : + - & {{}} on sets     {GREEN}x₁{RST}  the variable x1     {GREEN}α β γ ...{RST}  variables (alpha, beta, ...)
+
 {BOLD}Sets:{RST}
-  {GREEN}range(a,b)    {RST}  continuous set {{>=a<b}};  {GREEN}~range(0,3){RST} → {{0,1,2}}
+  {GREEN}range(a,b[,step]){RST}  the whole numbers a .. b-1:  range(3) → {{0,1,2}}
+  {GREEN}interval(a,b) {RST}  every value between a and b, ends excluded: {{>a<b}};  {GREEN}~interval(5){RST} → {{1,2,3,4}}
+  {GREEN}interval(a,b,"[)"){RST}  ends as in maths: "[]" closed, "()" open, "[)" and "(]" mixed → {{>=a<b}}
+  {GREEN}x:S           {RST}  is x an element of the set S, or (for a set x) a subset: 5:{{>=0<20}} → True
+  {GREEN}{{>0<5}}+{{>=5<9}}{RST}  joins overlapping and touching ranges → {{>0<9}}
+  {GREEN}A-B   A&B     {RST}  what is in A but not in B / in both:  {{>=0<10}}-{{>=3<5}} → {{>=0<3,>=5<10}}
+  {GREEN}|S|           {RST}  absolute value of every member:  |{{-2,1}}| → {{2,1}};  |{{>-3<2}}| → {{>=0<3}}
   {GREEN}~x            {RST}  round a number, or turn a set into its whole-number members (see rounding)
 
 {BOLD}Rounding{RST} (round(), ~ and ~= follow one mode; display rounding and floor/ceil are not affected):
@@ -6445,7 +6629,118 @@ _SYMBOL_MAP = {'\u2212': '-', '\u2013': '-', '\u00d7': '*', '\u22c5': '*', '\u00
                '\u00a0': ' ', '\u2009': ' ', '\u202f': ' ', '\u03c0': 'pi', '\u00b2': '**2', '\u00b3': '**3'}
 
 
+_SUP_MAP = {'\u2070': '0', '\u00b9': '1', '\u00b2': '2', '\u00b3': '3', '\u2074': '4', '\u2075': '5', '\u2076': '6',
+            '\u2077': '7', '\u2078': '8', '\u2079': '9', '\u207a': '+', '\u207b': '-', '\u207d': '(', '\u207e': ')',
+            '\u207f': 'n', '\u2071': 'i', '\u02e3': 'x', '\u02b8': 'y', '\u1dbb': 'z', '\u1d43': 'a', '\u1d47': 'b',
+            '\u1d9c': 'c', '\u1d48': 'd', '\u1d49': 'e', '\u1da0': 'f', '\u1d4d': 'g', '\u02b0': 'h', '\u02b2': 'j',
+            '\u1d4f': 'k', '\u02e1': 'l', '\u1d50': 'm', '\u1d52': 'o', '\u1d56': 'p', '\u02b3': 'r', '\u02e2': 's',
+            '\u1d57': 't', '\u1d58': 'u', '\u1d5b': 'v', '\u02b7': 'w'}
+_SUP_RE = re.compile('[' + ''.join(_SUP_MAP) + ']+')
+_SUB_DIGITS = {chr(0x2080 + k): str(k) for k in range(10)}
+_VULGAR = {'\u00bd': (1, 2), '\u2153': (1, 3), '\u2154': (2, 3), '\u00bc': (1, 4), '\u00be': (3, 4), '\u2155': (1, 5),
+           '\u2156': (2, 5), '\u2157': (3, 5), '\u2158': (4, 5), '\u2159': (1, 6), '\u215a': (5, 6), '\u2150': (1, 7),
+           '\u215b': (1, 8), '\u215c': (3, 8), '\u215d': (5, 8), '\u215e': (7, 8), '\u2151': (1, 9), '\u2152': (1, 10),
+           '\u2189': (0, 3)}
+_GREEK = {'\u03b1': 'alpha', '\u03b2': 'beta', '\u03b3': 'gamma', '\u03b4': 'delta', '\u03b5': 'epsilon', '\u03b6': 'zeta',
+          '\u03b7': 'eta', '\u03b8': 'theta', '\u03b9': 'iota', '\u03ba': 'kappa', '\u03bb': 'lambda', '\u03bc': 'mu',
+          '\u00b5': 'mu', '\u03bd': 'nu', '\u03be': 'xi', '\u03bf': 'omicron', '\u03c1': 'rho', '\u03c3': 'sigma',
+          '\u03c2': 'sigma', '\u03c5': 'upsilon', '\u03c7': 'chi', '\u03c8': 'psi', '\u03c9': 'omega'}
+_SIMPLE_SYMBOLS = {
+    '\u2212': '-', '\u2013': '-', '\u2014': '-', '\u2010': '-', '\u2011': '-', '\u2012': '-', '\ufe63': '-',
+    '\u00d7': '*', '\u22c5': '*', '\u00b7': '*', '\u2219': '*', '\u2217': '*', '\u2715': '*',
+    '\u00f7': '/', '\u2215': '/', '\u2044': '/', '\u2236': '/',
+    '\u2264': '<=', '\u2265': '>=', '\u2260': '!=', '\u2248': '~=', '\u2a7d': '<=', '\u2a7e': '>=',
+    '\u2208': ':', '\u2282': ':', '\u2286': ':', '\u220a': ':',
+    '\u222a': '+', '\u2216': '-', '\u2229': '&', '\u2205': '{}', '\u221e': 'inf', '\u00ac': '!', '\u2254': '=',
+    '\u2223': '|', '\u00b0': '*(pi/180)', '\u2030': '/1000', '\u212f': 'e', '\u03c0': 'pi', '\u03c4': 'tau',
+    '\u03c6': 'phi', '\u03d5': 'phi', '\u0127': 'hbar', '\u210f': 'hbar',
+    '\u00a0': ' ', '\u2009': ' ', '\u202f': ' ', '\u2002': ' ', '\u2003': ' ', '\u2004': ' ', '\u2005': ' ',
+    '\u2006': ' ', '\u2007': ' ', '\u2008': ' ', '\u200a': ' ', '\u3000': ' ', '\u200b': '', '\ufeff': '',
+    '\u2018': "'", '\u2019': "'", '\u201c': '"', '\u201d': '"',
+    '\u230a': 'floor(', '\u230b': ')', '\u2308': 'ceil(', '\u2309': ')',
+}
+_ROOT_FNS = {'\u221a': 'sqrt', '\u221b': 'cbrt', '\u221c': 'root4'}
+
+
+def _root_operand(s, i):
+    """The end of the operand after a radical sign at s[i-1]: a bracket, a number, a call or a name."""
+    n = len(s)
+    if i >= n:
+        return i
+    if s[i] == '(':
+        depth = 0
+        for j in range(i, n):
+            if s[j] == '(': depth += 1
+            elif s[j] == ')':
+                depth -= 1
+                if depth == 0: return j + 1
+        return n
+    if s[i].isdigit() or s[i] == '.':
+        m = re.compile(r'\d*\.?\d+').match(s, i)
+        return m.end() if m else i + 1
+    if s[i].isalpha() and s[i].isascii():
+        m = re.compile(r'[A-Za-z]+').match(s, i)
+        word_end = m.end()
+        if word_end < n and s[word_end] == '(':
+            return _root_operand(s, word_end)
+        if s.startswith('pi', i) or s.startswith('tau', i) or s.startswith('phi', i):
+            return i + (3 if not s.startswith('pi', i) else 2)
+        return i + 1
+    return i
+
+
+def _normalize_symbols(s: str) -> str:
+    """Typed or pasted maths symbols to plain input: x\u00b2 \u00b9\u2070 \u00bd 1\u00bd \u221a \u03c0 \u2264 \u2208 \u00b0 \u230a\u230b and so on."""
+    if s.isascii():
+        return s
+    s = ''.join(chr(ord(c) - 0xFEE0) if '\uff01' <= c <= '\uff5e' else c for c in s)
+    # fraction slash between raised and lowered digits: \u00b3\u2044\u2084 is 3/4
+    s = re.sub('([\u2070\u00b9\u00b2\u00b3\u2074-\u2079]+)\u2044([\u2080-\u2089]+)',
+               lambda m: '(' + ''.join(_SUP_MAP[c] for c in m.group(1)) + '/' + ''.join(_SUB_DIGITS[c] for c in m.group(2)) + ')', s)
+    # vulgar fractions, and mixed numbers like 1\u00bd
+    def vulgar(m):
+        a, b = _VULGAR[m.group(2)]
+        frac = f'({a}/{b})'
+        return f'({m.group(1)}+{frac})' if m.group(1) else frac
+    s = re.sub('(\\d+(?:\\.\\d+)?)?([' + ''.join(_VULGAR) + '])', vulgar, s)
+    # raised text: x\u00b2, x\u207b\u00b9, 2\u207f
+    s = _SUP_RE.sub(lambda m: '**(' + ''.join(_SUP_MAP[c] for c in m.group(0)) + ')', s)
+    # lowered digits: x\u2081 is the variable x1
+    s = re.sub('([A-Za-z\u03b1-\u03c9])([\u2080-\u2089]+)',
+               lambda m: '_' + _GREEK.get(m.group(1), m.group(1)) + ''.join(_SUB_DIGITS[c] for c in m.group(2)) + '_', s)
+    # radicals
+    out, i = [], 0
+    while i < len(s):
+        c = s[i]
+        if c in _ROOT_FNS:
+            j = _root_operand(s, i + 1)
+            inner = s[i + 1:j]
+            inner = inner if inner.startswith('(') else '(' + inner + ')'
+            fn = _ROOT_FNS[c]
+            out.append(f'root({_normalize_symbols(inner)},4)' if fn == 'root4' else f'{fn}({_normalize_symbols(inner)})')
+            i = j
+        else:
+            out.append(c)
+            i += 1
+    s = ''.join(out)
+    # everything else, one symbol at a time; letters (Greek) are names, so not inside quoted text
+    out, q = [], ''
+    for c in s:
+        if q:
+            if c == q: q = ''
+            out.append(_SIMPLE_SYMBOLS.get(c, c) if c in _SIMPLE_SYMBOLS else c)
+        elif c in ('"', "'"):
+            q = c
+            out.append(c)
+        elif c in _GREEK:
+            out.append('_' + _GREEK[c] + '_')
+        else:
+            out.append(_SIMPLE_SYMBOLS.get(c, c))
+    return ''.join(out)
+
+
 def _strip_spaces(s: str) -> str:
+    s = _normalize_symbols(s)
     buf = []
     in_str = False; str_char = ''
     last_was_callable = False
@@ -6670,6 +6965,10 @@ def _rewrite_special_syntax(tokens: list, lo: int, hi: int, v_dict: dict, in_sub
             conds = ','.join(f"({_group_tokens(c, 0, len(c), v_dict)})" for c in _split_args_top(cond_t) if c)
             return f"(({sub(then_t)}) if _all_true({conds}) else ({sub(else_t)}))"
 
+    for k in _depth0(tokens, lo, hi):
+        if tokens[k].string == ':' and lo < k < hi - 1:
+            return f"_member(({sub(tokens[lo:k])}),({sub(tokens[k + 1:hi])}))"
+
     rewritten = _rewrite_prefix(tokens, lo, hi, '!', '_not', v_dict, in_subscript, in_str_call)
     if rewritten is not None:
         return sub(rewritten)
@@ -6684,6 +6983,9 @@ def _rewrite_special_syntax(tokens: list, lo: int, hi: int, v_dict: dict, in_sub
     if rewritten is not None:
         return sub(rewritten)
     return None
+
+
+_PERCENT_FOLLOWERS = (')', ']', '}', ',', '*', '/', '**', '//', '^', '<', '>', '<=', '>=', '==', '!=', '&', ':')
 
 
 def _group_tokens(tokens: list, lo: int, hi: int, v_dict: dict, in_subscript: bool = False, in_str_call: bool = False) -> str:
@@ -6740,6 +7042,10 @@ def _group_tokens(tokens: list, lo: int, hi: int, v_dict: dict, in_subscript: bo
                 raise CalcError("Empty parentheses.")
             atoms.append((open_ch + inner + close_ch, t, tokens[j - 1]))
             i = j
+        elif (t.string == '%' and t.type == tokenize.OP and atoms and
+              (i + 1 >= hi or tokens[i + 1].string in _PERCENT_FOLLOWERS)):
+            atoms.append(('*dec("0.01")', t, t))     # 5%  is 5*0.01 ; 7%3 stays the remainder
+            i += 1
         else:
             atoms.append((_tok_text(t), t, t))
             i += 1
@@ -6847,6 +7153,7 @@ def _compile_source(src: str):
 
 _EVAL_HELPERS = {
     '_Bool': _Bool,
+    '_member': _member,
     '_op_pow': _op_pow,
     '_op_truediv': _op_truediv,
     '_op_floordiv': _op_floordiv,
@@ -7042,7 +7349,7 @@ def _parse_ineq_assignment(seg: str):
     return lhs, '{' + rest + '}'
 
 
-_ASSIGN_OP_RE = re.compile(r'(\*\*|//|[+\-*/|])?=')
+_ASSIGN_OP_RE = re.compile(r'(\*\*|//|[+\-*/|&%^])?=')
 
 
 def _split_assign_seg(seg: str):
@@ -7494,7 +7801,7 @@ def evaluate(raw: str) -> None:
     inline_str, exp = split_inline(raw)
 
     targets = set(_assign_targets(inline_str))
-    lead = re.match(r'^([A-Za-z][A-Za-z0-9]*)(?:\*\*|//|[+\-*/|])?=(?!=)', raw)
+    lead = re.match(r'^([A-Za-z][A-Za-z0-9]*)(?:\*\*|//|[+\-*/|&%^])?=(?!=)', raw)
     if lead and lead.group(1) in dco:
         targets.add(lead.group(1))
     for t in sorted(targets):

@@ -8,7 +8,7 @@ computational physics.
 ## Features
 
 - **Decimal arithmetic** – 50 digits of precision, `0.1+0.2` is `0.3`
-- **Natural notation** – `2x**2+1`, `2(5)`, `2pi`, pasted `× ÷ π ²`
+- **Natural notation** – `2x**2+1`, `2(5)`, `2pi`, pasted `× ÷ π ² ½ √ ≤ ∈`, see Symbols
 - **Missing variables are asked for** – `x*2+y` prompts for `x` and `y`, then
   allows changing them and showing the result again
 - **Complex numbers** – `sqrt(-4)` is `2i`, with optional extra imaginary units (`j`, `k`, ...)
@@ -181,7 +181,9 @@ number is asked for again on the next line. Variables and constants stored with 
 and `const` are remembered too. A constant, an active imaginary unit or an internal
 constant or function (`e`, `pi`, `sin`, ...) cannot be assigned; the error says which it is.
 
-Assignment operators: `+=` `-=` `*=` `/=` `//=` `**=` `|=`.
+Assignment operators: `+=` `-=` `*=` `/=` `//=` `**=` `^=` `%=` `&=`. They work on numbers, functions
+and sets (`&=` keeps what is in both sets, `-=` on a set removes from it). There is no `|=`:
+`|` is the absolute value, never a binary operator.
 
 ```
 x=10;x//=3;x                      → 3
@@ -392,28 +394,86 @@ as `ln(x)/x` at infinity. Divergent sums such as `1/x` are not detected.
 Indexing starts at 0 and an index past the end wraps around.
 
 On a finite set, `+` adds a member, `-` removes one, and `*`, `/`, `//`, `**` apply to
-every member. `|` is union.
+every member. `+` between two sets is union.
 
 ```
 {0}+1                             → {0,1}
 {1,2,3}-2                         → {1,3}
 {1,2}*3                           → {3,6}
-{1,2}|{2,3}                       → {1,2,3}
+{1,2}+{2,3}                       → {1,2,3}
 sort({3,1,2})                     → {1,2,3}
 ```
 
-A set can also be a range, `{>=0<10}`, or two ranges, `{<0,>5}`. `+` and `*` shift or
-scale the range.
+A set can also hold every value between two edges, `{>=0<10}`, or several such parts,
+`{<0,>5}`. `+` and `*` shift or scale it.
 
 ```
 {>0}+1                            → {>1}
 {>=0<10}[5]                       → 5
-~range(0,3)                       → {0,1,2}
 ~2.5                              → 2
 ```
 
-`~` rounds: a number becomes a whole number, a set becomes its whole-number members.
-Ties follow the [rounding mode](#rounding), as in `round`: half even by default, so `~2.5` is `2`.
+### range and interval
+
+`range` makes a set of whole numbers, `interval` a set of every value between the edges.
+
+```
+range(5)                          → {0,1,2,3,4}
+range(2,5)                        → {2,3,4}
+range(5,0,-2)                     → {5,3,1}      range(start, stop, step), like randrange
+interval(5)                       → {>0<5}       the ends are not included
+interval(0,5)                     → {>0<5}
+interval(0,5,"[)")                → {>=0<5}      the ends as in maths: "[]" "[)" "(]" "()"
+~interval(5)                      → {1,2,3,4}    its whole numbers, the same as range(5)-{0}
+```
+
+### Element and subset: `:`
+
+`x:S` is true when the number `x` is in the set `S`, or, when `x` is a set, when it is a
+subset of `S`.
+
+```
+5:{>=0<20}                        → True
+20:{>=0<20}                       → False
+2:{1,2,3}                         → True
+{1,2}:{1,2,3}                     → True
+{>=1<3}:{>=0<20}                  → True
+(1):IF(x:{>0<9}):(0)              the condition of an IF, like any other
+```
+
+`:` is the last operator to be applied, so `2+3:{5}` is `(2+3):{5}`. It does not work with
+sets that have index rules.
+
+### Joining, removing and intersecting sets
+
+`+` joins two sets. Parts that overlap or touch are merged, and a single number is taken
+in when it fits at an end. Two parts that only meet at an excluded point stay apart.
+`-` removes what the second set holds, `&` keeps what is in both. All three work on
+finite and continuous sets, mixed.
+
+```
+{>0<5}+{>=5<9}                    → {>0<9}
+{>0<5}+{5}                        → {>0<=5}
+{>0<5}+{>5<9}                     → {>0<5,>5<9}     5 is in neither
+{>5,<0}                           → {<0,>5}
+{>=0<10}-{>=3<5}                  → {>=0<3,>=5<10}
+{>=0<10}-{5}                      → {>=0<5,>5<10}
+{1,2,3,12}-{>1<5}                 → {1,12}
+{>=0<10}&{>=5<20}                 → {>=5<10}
+{1,2,12}&{>=0<5}                  → {1,2}
+{>=0<10}&{>10<20}                 → {}
+```
+
+### Absolute value of a set
+
+`|S|` and `abs(S)` take the absolute value of every member. For a continuous set the whole
+range is mapped, so a range across zero starts at 0.
+
+```
+|{-2,2,1}|                        → {2,1}
+|{>-3<2}|                         → {>=0<3}
+|{>-5<=-1}|                       → {>=1<5}
+```
 
 Single indexes can have their own value, or a rule can cover all indexes:
 
@@ -751,6 +811,34 @@ The result for a few numbers:
 The mode applies to numbers, to complex numbers (each part) and to the members of a set.
 The digits shown in an answer (`prec`) and the functions `floor`, `ceil` and `int` do not use it.
 The mode is stored by `save`.
+
+## Symbols
+
+Maths symbols can be typed or pasted; they are turned into plain input first, so they
+work in every command, in quoted functions and with `sym`.
+
+| Symbol | Meaning | Example |
+| --- | --- | --- |
+| `⁰¹²³⁴⁵⁶⁷⁸⁹` `⁺⁻` `⁽⁾` `ⁿ` `ˣ` ... | power | `2¹⁰` is 1024, `x⁻¹` is `x**(-1)`, `x⁽ⁿ⁺¹⁾` |
+| `½ ⅓ ⅔ ¼ ¾ ⅕ ⅖ ⅗ ⅘ ⅙ ⅚ ⅐ ⅛ ⅜ ⅝ ⅞ ⅑ ⅒ ↉` | fraction | `½` is 0.5, `¼*8` is 2 |
+| digits and a vulgar fraction | mixed number | `2½` is 2.5 |
+| `³⁄₄` (raised, fraction slash, lowered) | fraction | `³⁄₄` is 0.75 |
+| `₀₁₂...` after a letter | a variable name | `x₁` is the variable `x1` |
+| `√` `∛` `∜` | roots | `√16`, `√(9+16)`, `∛27`, `√2×√2` |
+| `× ⋅ · ∙ ∗` `÷ ∕ ⁄ ∶` `− – —` | `*` `/` `-` | `7÷2` is 3.5 |
+| `π` `τ` `φ` `ħ` `ℯ` `∞` | `pi` `tau` `phi` `hbar` `e` `inf` | `2π` |
+| `°` and `‰` | degrees (in radians) and per mille | `sin(30°)` is 0.5, `5‰` is 0.005 |
+| `%` after a number, with nothing to calculate after it | per cent | `5%` is 0.05, `200*5%` is 10, `(3+2)%` is 0.05; `7%3` is still the remainder |
+| `⌊x⌋` `⌈x⌉` | `floor(x)` `ceil(x)` | `⌊2.7⌋+⌈2.1⌉` is 5 |
+| `≤ ≥ ≠ ≈` | `<=` `>=` `!=` `~=` | `{≥0<20}` is `{>=0<20}` |
+| `∈` `⊂` `⊆` | `:` element or subset | `5∈{>0<9}`, `{1,2}⊆{1,2,3}` |
+| `∪` `∖` `∩` `∅` | `+` `-` `&` `{}` | `{1,2}∩{2,3}` is `{2}` |
+| `¬` | `!` | |
+| `α β γ δ ε ζ η θ ι κ λ μ ν ξ ρ σ χ ψ ω` | variables | `α=2` stores the variable `alpha` (typed as `_alpha_`) |
+| `＋ ＝ （ ）` and other full-width forms, thin and no-break spaces, curly quotes | their plain versions | |
+
+A radical takes the number, name, call or bracket right after it: `√2x` is `sqrt(2)*x`,
+`√sin(x)` is `sqrt(sin(x))`, `√(x+1)` needs the brackets.
 
 ## Commands
 
