@@ -13,6 +13,7 @@ computational physics.
   allows changing them and showing the result again
 - **Complex numbers** – `sqrt(-4)` is `2i`, with optional extra imaginary units (`j`, `k`, ...)
 - **Calculus** – derivatives, integrals, limits, sums, roots
+- **Symbolic algebra** – `sym on`: `(x^2-1)/(x-1)` is `x + 1`, unset variables stay in the answer; no extra packages
 - **Functions and sets** – `f="x**2+3x"`, `{1,2,3}`, `{>=0<10}`
 - **Saves** – variables, constants and functions can be saved and loaded
 - **Scriptable** – `--pipe` reads expressions from stdin
@@ -574,6 +575,137 @@ constant or a built-in (`e`, `pi`, ...).
 
 Units, their order and their on/off state are stored by `save`.
 
+## Symbolic algebra
+
+`sym` simplifies expressions exactly and keeps unset variables in the answer, so they
+need no value. It is built in and needs nothing besides `mpmath`.
+
+```
+sym on               every expression is simplified symbolically
+sym off              back to numbers (unset variables are asked for)
+sym                  show the mode
+sym <expression>     one expression, whatever the mode
+sym <op> <expression>  one operation, see below
+```
+
+`--sym` starts with the mode on, and `save` stores it.
+
+```
+>> sym on
+>> x*2+x
+3x
+>> (x^2-1)/(x-1)
+x + 1
+>> 1/x+1/(x+1)
+(2x + 1)/(x*(x + 1))
+>> 1-sin(x)^2
+cos(x)^2
+>> sqrt(8)+sqrt(2)+x
+x + 3*sqrt(2)
+>> 0.5*x
+x/2
+```
+
+### Operations
+
+| Command | Result |
+| --- | --- |
+| `sym simplify e` (or `sym e`) | a polynomial is multiplied out (`(a+b)^2` is `a^2 + 2a*b + b^2`, unless that gets very long, like `(x+1)^20`); a fraction gets the shortest of the factored, expanded and single-fraction forms |
+| `sym expand e` | sum of terms: `(x+1)^2` is `x^2 + 2x + 1` |
+| `sym factor e` | product of factors: `x^2*y-y` is `y*(x + 1)(x - 1)` |
+| `sym cancel e` (`sym together e`, `sym frac e`) | one fraction in lowest terms |
+| `sym apart e` | partial fractions: `1/(x^2-1)` is `1/(2(x - 1)) - 1/(2(x + 1))` |
+| `func(a, b, ...)` | the expressions, added, as a quoted expression; simplified with `sym on` or after `sym`; see below |
+| `sym collect x: e` | powers of `x` grouped: `a*x+b*x+x^2+c` is `x^2 + (a + b)*x + c` |
+
+`apart` and `collect` take the variable in front, like `x: expr`; without it the only
+variable (or the first one) is used. `apart` needs a denominator with one variable.
+
+The operations are also functions, for use inside other expressions and for stored
+functions: `simplify("(x^2-1)/(x-1)")`, `expand(f)`, `factor(f)`, `cancel(f)`,
+`apart(f)`, `collect(f, "x")`, where `f` is a stored function or a text.
+
+### Assignments after an operation
+
+An operation in front of an assignment stores the result of that operation as a quoted
+expression, so `sym cancel x=0.34` stores `x = "17/50"`. This works for every operation
+(`sym expand w=(a+b)^2`, `sym factor v=a^2-b^2`, `sym collect x: t=a*x+b*x`) and for
+several assignments in one line (`sym cancel p=0.5;r=p+1`). `sym` alone before an assignment
+makes it symbolic, as in `sym h=(x+1)(x-1)`.
+
+### frac: a number as a fraction
+
+`frac(0.34)` is `"17/50"`: a quoted expression, so it can be assigned straight away,
+`q=frac(0.75)`. A long decimal that is a rounded simple fraction (`frac(1/3)`) gives that
+fraction; a number that is not close to a simple one (`frac(pi)`) is an error. `frac` of a
+quoted expression is `cancel`. `sym frac x=0.34` and `sym cancel 0.34` do the same for
+one value.
+
+### func: an expression as a quoted expression
+
+`func(a, b, ...)` returns its arguments as a quoted expression, without asking for any
+variable, so the result can be assigned straight away. Several arguments are added
+together. With `sym on`, and after `sym`, the result is simplified.
+
+```
+>> f=func(x*2+x)
++ f = "x*2+x"  (variable added)
+>> sym on
+>> f=func((a+b)^2)
++ f = "a^2 + 2a*b + b^2"  (variable added)
+>> g=func((a+b)^2, a*b)
++ g = "a^2 + 3a*b + b^2"  (variable added)
+>> sym off
+>> sym f=func((a+b)^2)
++ f = "a^2 + 2a*b + b^2"  (variable updated)
+```
+
+`sym` in front of an assignment makes that one assignment symbolic, with or without
+`func`: `sym h=(x+1)(x-1)` stores `"x^2 - 1"`.
+
+### What it knows
+
+- Polynomials and fractions of several variables, exactly: factoring over the integers,
+  gcd, cancelling, rationalizing `1/(1+sqrt(2))`.
+- Roots and powers: `sqrt(x)^2` is `x`, `sqrt(12)` is `2*sqrt(3)`, `e^x*e^y` is `exp(x + y)`.
+- `sin`, `cos`, `sinh`, `cosh` identities (`sin(x)^2+cos(x)^2` is `1`), exact values
+  at multiples of `pi/12`, parity (`sin(-x)` is `-sin(x)`), `asin(sin(pi/6))` style
+  compositions, `ln` of rationals, `exp(ln(x))`, `abs` of products.
+- `pi`, `e`, imaginary units and stored constants stay symbols.
+- Other functions (`tan`, `gamma`, ...) are kept as they are, with simplified arguments.
+
+An expression with no variables at all (`1/3`, `2pi`) is still a plain calculation and
+prints a decimal in the mode; `sym 1/3` or `sym sqrt(8)` gives `1/3` and `2*sqrt(2)`.
+
+Numbers are exact: `0.5` is `1/2`, and a long stored decimal is read as the simple
+fraction it is close to. Unset variables are taken as real, so `sqrt(x^2)` is `abs(x)`
+and `ln(exp(x))` is `x`. Roots of sums, like `sqrt(x+1)`, stay as they are.
+
+### Assignment
+
+In `sym` mode an assignment stores the simplified result as a function:
+
+```
+>> g=x*2+x
++ g = "3x"  (variable added)
+>> g*2
+6x
+>> f=x^2+1
+>> f(y+1)
+y^2 + 2y + 2
+```
+
+A stored variable with a value wins over a symbol of the same name, so after `a=2`
+the `a` in `a*x+x` is `2`. `varrm` it to make it a symbol again. Names of internal
+functions and constants cannot be assigned.
+
+### Limits
+
+Expressions that `sym` does not handle (sets, comparisons, text, subscripts, ...) go
+through the normal calculator, so turning the mode on never takes a feature away.
+Factoring is given 3 seconds; on very large polynomials the factored form is skipped
+and the expanded one is shown.
+
 ## Rounding
 
 `round()`, `~` and `~=` all use one rounding mode. `rounding` shows it, `rounding <mode>` changes it.
@@ -632,12 +764,13 @@ The mode is stored by `save`.
 | `var ...` | variables: `var`, `varrm`, `varrmall` |
 | `const ...` | constants: `const`, `constrm`, `constex`, `constin`, `constrmall` |
 | `img ...` | imaginary units: `img`, `imgrm`, `imgrmall` |
+| `sym ...` | symbolic algebra: `sym on`, `sym off`, `sym <expression>`, `sym factor ...`, see Symbolic algebra |
 | `save`, `load`, ... | see Saving |
 
 ## Saving
 
 ```
-save work            save variables, functions, sets, constants, imaginary units and the rounding mode
+save work            save variables, functions, sets, constants, imaginary units, the rounding mode and the sym mode
 load work
 saves                list, * marks the default one
 saverm work          delete one
@@ -665,6 +798,7 @@ options.
 | `--no-prompt` | exit after the given expressions; implies `--no-loop` |
 | `--no-loop` | skip the variable loop (`x>`) after an answer |
 | `--no-ask` | fail on a missing value instead of asking; `const` replaces without asking |
+| `--sym` | start with symbolic algebra on |
 | `--no-color`, `--no-colors` | colors off |
 | `--color` | colors on, overriding `NO_COLOR` and `--pipe` |
 | `--prec N` | display N digits |
