@@ -159,8 +159,26 @@ In the loop:
 A value typed at the prompt overrides an inline assignment. While the variables
 are asked for, `back` returns to the previous question and `new` drops the expression.
 
-Assigned functions and sets are remembered for the session, and so are variables and
-constants stored with `var` and `const`. Plain numbers are asked for again on the next line.
+A line that holds only assignments stores the variable for the session, whatever its
+value is: a number, a complex number, a function, a set or text. The answer is the same
+as `var` gives:
+
+```
+>> o=20
++ o = 20  (variable added)
+>> o=i
++ o = i  (variable updated)
+>> o='10'
++ o = "10"  (variable updated)
+>> a=1;b=a+1
++ a = 1  (variable added)
++ b = 2  (variable added)
+```
+
+An assignment inside an expression (`x=3;x+1`) is only used by that expression; the
+number is asked for again on the next line. Variables and constants stored with `var`
+and `const` are remembered too. A constant, an active imaginary unit or an internal
+constant or function (`e`, `pi`, `sin`, ...) cannot be assigned; the error says which it is.
 
 Assignment operators: `+=` `-=` `*=` `/=` `//=` `**=` `|=`.
 
@@ -281,8 +299,8 @@ next `name=` starts the next item, and a later item can use an earlier one.
 Changing a variable asks nothing. `var` refuses the name of a constant (`const` is used
 for those). `var(1,2,3)` is still the variance function.
 
-Assigned functions and sets (`f="x**2"`, `s={1,2}`) are variables too: `var` lists them,
-`varrm` and `varrmall` remove them.
+Everything stored by a bare assignment (`o=5`, `f="x**2"`, `s={1,2}`) is a variable too: `var` lists it,
+`varrm` and `varrmall` remove it.
 
 ## Constants
 

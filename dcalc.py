@@ -24,13 +24,17 @@ import decimal
 import difflib
 import inspect
 import io
+import itertools
 import json
+import math
 import os
 import random
 import re
 import sys
 import threading
+import time
 import tokenize
+from fractions import Fraction
 
 import mpmath
 
@@ -3104,7 +3108,7 @@ def _write_saves(data: dict) -> None:
 def _snapshot() -> dict:
     return {'vars':   {_demangle_text(k): _enc(v) for k, v in _user_vars.items()},
             'consts': {_demangle_text(k): _enc(v) for k, v in _const_vars.items()},
-            'settings': {'prec': DISPLAY_PREC, 'rounding': _rounding[0],
+            'settings': {'prec': DISPLAY_PREC, 'rounding': _rounding[0], 'sym': _SYM_MODE[0],
                          'units': [[_disp_name(_UNIT_KEYS[u]), u not in _UNIT_OFF] for u in _UNIT_LIST]}}
 
 
@@ -3147,6 +3151,7 @@ def _restore_all(snap: dict) -> int:
     _const_vars.clear(); _const_vars.update(consts)
     if 'prec' in st and int(st['prec']) != DISPLAY_PREC: actions(f"prec {int(st['prec'])}")
     if st.get('rounding') in _ROUNDING_MODES: _rounding[0] = st['rounding']
+    if 'sym' in st: _SYM_MODE[0] = bool(st['sym'])
     return len(vars_) + len(consts)
 
 
@@ -3158,6 +3163,2528 @@ def _autoload_default(announce: bool = True) -> None:
             if announce: print(f"{GRAY}loaded default save '{data['default']}'{RST}")
     except CalcError as ex:
         print(_fmt_error(str(ex)))
+
+
+# SYMBOLIC
+
+
+class _SymError(CalcError):
+    """An expression the symbolic engine cannot handle (the ordinary evaluation takes over)."""
+
+
+_SYM_MODE     = [False]       # `sym on`: unset variables stay in the answer
+_SYM_MAXPOW   = 400           # largest whole exponent that is multiplied out
+_SYM_MAXTERMS = 6000          # a polynomial longer than this is refused
+_SYM_MAXDEG   = 360           # largest degree handed to the factoring code
+
+_ATOMS: dict = {}
+
+
+class _Atom:
+    """A building block of an expression: a variable, a constant, an imaginary unit, a function call
+    such as sin(x), a root such as sqrt(x+1), or a symbolic power such as e^x."""
+    __slots__ = ('key', 'kind', 'a', 'b', 'var', 'red', 'rank')
+
+    def __init__(self, key, kind, a, b, var, red, rank):
+        self.key, self.kind, self.a, self.b, self.var, self.red, self.rank = key, kind, a, b, var, red, rank
+
+
+def _atom(key, kind, a=None, b=None, var=False, red=0, rank=2):
+    at = _ATOMS.get(key)
+    if at is None:
+        at = _ATOMS[key] = _Atom(key, kind, a, b, var, red, rank)
+    return at
+
+
+def _mono_mul(a, b):
+    if not a: return b
+    if not b: return a
+    d = dict(a)
+    for k, e in b:
+        d[k] = d.get(k, 0) + e
+    return tuple(sorted(d.items()))
+
+
+def _mono_div(a, b):
+    """a / b, or None when b does not divide a."""
+    d = dict(a)
+    for k, e in b:
+        v = d.get(k, 0) - e
+        if v < 0: return None
+        if v: d[k] = v
+        else: d.pop(k, None)
+    return tuple(sorted(d.items()))
+
+
+def _mono_deg(m):
+    return sum(e for _, e in m)
+
+
+def _mono_order(m):
+    return (_mono_deg(m), m)
+
+
+class _SP:
+    """A polynomial: {monomial: Fraction}. A monomial is a tuple of (atom key, exponent), sorted by key."""
+    __slots__ = ('t',)
+
+    def __init__(self, t=None):
+        self.t = t if t is not None else {}
+
+    @staticmethod
+    def const(c):
+        c = Fraction(c)
+        return _SP({(): c}) if c else _SP()
+
+    @staticmethod
+    def atom(key, e=1):
+        return _SP({((key, e),): Fraction(1)})
+
+    def __bool__(self):
+        return bool(self.t)
+
+    def __add__(self, o):
+        t = dict(self.t)
+        for m, c in o.t.items():
+            v = t.get(m, 0) + c
+            if v: t[m] = v
+            else: t.pop(m, None)
+        return _SP(t)
+
+    def __neg__(self):
+        return _SP({m: -c for m, c in self.t.items()})
+
+    def __sub__(self, o):
+        t = dict(self.t)
+        for m, c in o.t.items():
+            v = t.get(m, 0) - c
+            if v: t[m] = v
+            else: t.pop(m, None)
+        return _SP(t)
+
+    def scale(self, c):
+        c = Fraction(c)
+        if not c: return _SP()
+        return _SP({m: v * c for m, v in self.t.items()})
+
+    def __mul__(self, o):
+        if not self.t or not o.t: return _SP()
+        if len(o.t) == 1:
+            (m2, c2), = o.t.items()
+            return _SP({_mono_mul(m1, m2): c1 * c2 for m1, c1 in self.t.items()})
+        if len(self.t) == 1:
+            return o * self
+        t = {}
+        for m1, c1 in self.t.items():
+            for m2, c2 in o.t.items():
+                m = _mono_mul(m1, m2)
+                v = t.get(m, 0) + c1 * c2
+                if v: t[m] = v
+                else: t.pop(m, None)
+        if len(t) > _SYM_MAXTERMS:
+            raise _SymError("The result is too long.")
+        return _SP(t)
+
+    def __pow__(self, n):
+        if n < 0: raise ValueError
+        r, b = _SP.const(1), self
+        while n:
+            if n & 1: r = r * b
+            n >>= 1
+            if n: b = b * b
+        return r
+
+    def is_const(self):
+        return not self.t or (len(self.t) == 1 and () in self.t)
+
+    def cval(self):
+        return self.t.get((), Fraction(0))
+
+    def atoms(self):
+        s = set()
+        for m in self.t:
+            for k, _ in m:
+                s.add(k)
+        return s
+
+    def canon(self):
+        return ';'.join(f"{c}*{m}" for m, c in sorted(self.t.items(), key=lambda kv: kv[0]))
+
+    def __eq__(self, o):
+        return isinstance(o, _SP) and self.t == o.t
+
+    def __hash__(self):
+        return hash(self.canon())
+
+
+def _lead(p):
+    """The leading monomial: used to give polynomials a sign / scale that is always the same."""
+    return max(p.t, key=_mono_order)
+
+
+def _red(p):
+    """Apply the relations of the atoms: i*i = -1, sqrt(a)*sqrt(a) = a, abs(a)^2 = a^2."""
+    for m in p.t:
+        for k, e in m:
+            r = _ATOMS[k].red
+            if r and e >= r:
+                break
+        else:
+            continue
+        break
+    else:
+        return p
+    res, extra = {}, []
+    for m, c in p.t.items():
+        keep, fac = [], None
+        for k, e in m:
+            at = _ATOMS[k]
+            if at.red and e >= at.red:
+                q, e = divmod(e, at.red)
+                if at.kind == 'unit':
+                    if q & 1: c = -c
+                else:
+                    if at.kind == 'rt':
+                        base = at.a
+                    else:
+                        arg = at.b[0].n
+                        base = arg * arg
+                    f = base ** q
+                    fac = f if fac is None else fac * f
+            if e: keep.append((k, e))
+        mono = tuple(keep)
+        if fac is None:
+            v = res.get(mono, 0) + c
+            if v: res[mono] = v
+            else: res.pop(mono, None)
+        else:
+            extra.append(_SP({mono: c}) * fac)
+    out = _SP(res)
+    for t in extra:
+        out = out + t
+    return _red(out) if extra else out
+
+
+def _pmul(a, b):
+    return _red(a * b)
+
+
+# ---- division and gcd (in the free polynomial ring: the atoms' relations are applied afterwards) ----
+
+def _sp_div(a, b):
+    """(q, r) with a = q*b + r, by lexicographic division over the atoms of a and b."""
+    gens = sorted(a.atoms() | b.atoms())
+    idx = {g: i for i, g in enumerate(gens)}
+    n = len(gens)
+
+    def vec(m):
+        v = [0] * n
+        for k, e in m: v[idx[k]] = e
+        return tuple(v)
+
+    def mono(v):
+        return tuple((gens[i], e) for i, e in enumerate(v) if e)
+
+    bt = {vec(m): c for m, c in b.t.items()}
+    blead = max(bt)
+    bc = bt[blead]
+    at = {vec(m): c for m, c in a.t.items()}
+    q, r = {}, {}
+    while at:
+        lead = max(at)
+        c = at[lead]
+        if all(x >= y for x, y in zip(lead, blead)):
+            qm = tuple(x - y for x, y in zip(lead, blead))
+            qc = c / bc
+            q[qm] = qc
+            for m, cc in bt.items():
+                mm = tuple(x + y for x, y in zip(qm, m))
+                v = at.get(mm, 0) - qc * cc
+                if v: at[mm] = v
+                else: at.pop(mm, None)
+        else:
+            r[lead] = c
+            del at[lead]
+    return _SP({mono(v): c for v, c in q.items()}), _SP({mono(v): c for v, c in r.items()})
+
+
+def _sp_exquo(a, b):
+    """a / b when b divides a, else None."""
+    if not a.t: return _SP()
+    q, r = _sp_div(a, b)
+    return None if r.t else q
+
+
+def _fgcd(x, y):
+    x, y = Fraction(x), Fraction(y)
+    return Fraction(math.gcd(x.numerator * y.denominator, y.numerator * x.denominator), x.denominator * y.denominator)
+
+
+def _sp_split_content(p):
+    """p = c * q with q an integer polynomial of content 1 and positive leading coefficient; c is a Fraction."""
+    if not p.t: return Fraction(0), p
+    L = 1
+    for v in p.t.values():
+        L = L * v.denominator // math.gcd(L, v.denominator)
+    g = 0
+    for v in p.t.values():
+        g = math.gcd(g, int(v * L))
+    c = Fraction(g, L)
+    q = p.scale(1 / c)
+    if q.t[_lead(q)] < 0:
+        q, c = -q, -c
+    return c, q
+
+
+def _split_var(p, x):
+    out = {}
+    for m, c in p.t.items():
+        e, rest = 0, []
+        for k, ee in m:
+            if k == x: e = ee
+            else: rest.append((k, ee))
+        out.setdefault(e, {})[tuple(rest)] = c
+    return {e: _SP(t) for e, t in out.items()}
+
+
+def _join_var(cd, x):
+    t = {}
+    for e, cp in cd.items():
+        xm = ((x, e),) if e else ()
+        for m, c in cp.t.items():
+            t[_mono_mul(m, xm)] = c
+    return _SP(t)
+
+
+def _prem(A, B):
+    """Pseudo-remainder of two polynomials in x whose coefficients are polynomials."""
+    db = max(B)
+    lb = B[db]
+    R = dict(A)
+    while R and max(R) >= db:
+        dr = max(R)
+        lr = R[dr]
+        new = {}
+        for e, cp in R.items():
+            v = cp * lb
+            if v.t: new[e] = v
+        for e, cp in B.items():
+            ee = e + dr - db
+            v = new.get(ee, _SP()) - lr * cp
+            if v.t: new[ee] = v
+            else: new.pop(ee, None)
+        R = new
+    return R
+
+
+def _content_x(cd):
+    g = None
+    for cp in cd.values():
+        g = cp if g is None else _sp_gcd(g, cp)
+    return g
+
+
+def _gcd_prim(a, b):
+    ga, gb = a.atoms(), b.atoms()
+    common = ga & gb
+    if not common:
+        return _SP.const(1)
+    x = min(common)
+    A, B = _split_var(a, x), _split_var(b, x)
+    ca, cb = _content_x(A), _content_x(B)
+    c = _sp_gcd(ca, cb)
+    P = {e: _sp_exquo(cp, ca) for e, cp in A.items()}
+    Q = {e: _sp_exquo(cp, cb) for e, cp in B.items()}
+    if max(P) < max(Q):
+        P, Q = Q, P
+    while True:
+        if max(Q) == 0:
+            g = {0: _SP.const(1)}
+            break
+        Rm = _prem(P, Q)
+        if not Rm:
+            g = Q
+            break
+        cr = _content_x(Rm)
+        Rm = {e: _sp_exquo(cp, cr) for e, cp in Rm.items()}
+        P, Q = Q, Rm
+    res = _join_var(g, x) * c
+    cc, res = _sp_split_content(res)
+    return res
+
+
+def _sp_gcd(a, b):
+    """Greatest common divisor of two polynomials (the free ring: unaware of the atoms' relations)."""
+    if not a.t and not b.t:
+        return _SP()
+    if not a.t or not b.t:
+        c, q = _sp_split_content(b if not a.t else a)
+        return q.scale(abs(c))
+    ca, pa = _sp_split_content(a)
+    cb, pb = _sp_split_content(b)
+    return _gcd_prim(pa, pb).scale(_fgcd(ca, cb))
+
+
+def _cancel(n, d):
+    """n/d in lowest terms with a monic denominator."""
+    if not n.t:
+        return n, _SP.const(1)
+    if d.is_const():
+        return n.scale(1 / d.cval()), _SP.const(1)
+    g = _sp_gcd(n, d)
+    if not g.is_const():
+        n2, d2 = _sp_exquo(n, g), _sp_exquo(d, g)
+        if n2 is not None and d2 is not None:
+            n, d = _red(n2), _red(d2)
+    lc = d.t[_lead(d)]
+    return n.scale(1 / lc), d.scale(1 / lc)
+
+
+# ---- rational functions ----
+
+def _quad_sq(at):
+    """The value of s*s for an atom with s^2 a polynomial: an imaginary unit or a square root."""
+    if at.kind == 'unit': return _SP.const(-1)
+    if at.kind == 'rt' and at.b == 2: return at.a
+    return None
+
+
+def _exq(a, g):
+    """a / g when that is exact, else a unchanged."""
+    q = _sp_exquo(a, g)
+    return a if q is None else q
+
+
+def _monic(n, d):
+    lc = d.t[_lead(d)]
+    return n.scale(1 / lc), d.scale(1 / lc)
+
+
+class _SR:
+    """A rational function n/d in lowest terms (d monic), over the atoms."""
+    __slots__ = ('n', 'd')
+
+    def __init__(self, n, d=None, norm=2):
+        """norm: 2 cancels common factors, 1 only makes the denominator monic, 0 trusts the caller."""
+        if d is None: d = _SP.const(1)
+        if not d.t: raise CalcError("Division by zero.")
+        if norm == 2:
+            n, d = _cancel(n, d)
+        elif norm == 1:
+            if not n.t: d = _SP.const(1)
+            elif d.is_const(): n, d = n.scale(1 / d.cval()), _SP.const(1)
+            else: n, d = _monic(n, d)
+        self.n, self.d = n, d
+
+    @staticmethod
+    def const(c):
+        return _SR(_SP.const(c), None, 0)
+
+    @staticmethod
+    def atom(key):
+        return _SR(_SP.atom(key), None, 0)
+
+    def cval(self):
+        """The value when this is a plain rational number, else None."""
+        if self.d.is_const() and self.n.is_const():
+            return self.n.cval() / self.d.cval()
+        return None
+
+    def is_zero(self):
+        return not self.n.t
+
+    def atoms(self):
+        return self.n.atoms() | self.d.atoms()
+
+    def __neg__(self):
+        return _SR(-self.n, self.d, 0)
+
+    def __add__(a, b):
+        if not a.n.t: return b
+        if not b.n.t: return a
+        if a.d == b.d:
+            return _SR(a.n + b.n, a.d)
+        if a.d.is_const() and b.d.is_const():
+            return _SR(a.n.scale(1 / a.d.cval()) + b.n.scale(1 / b.d.cval()), None, 0)
+        g = _sp_gcd(a.d, b.d)
+        da, db = _sp_exquo(a.d, g), _sp_exquo(b.d, g)
+        if da is None or db is None:
+            return _SR(_red(a.n * b.d + b.n * a.d), _pmul(a.d, b.d))
+        return _SR(_red(a.n * db + b.n * da), _pmul(a.d, db))
+
+    def __sub__(a, b):
+        return a + (-b)
+
+    def __mul__(a, b):
+        if not a.n.t or not b.n.t:
+            return _SR.const(0)
+        if a.d.is_const() and b.d.is_const():
+            return _SR(_pmul(a.n, b.n), None, 1)
+        g1 = _sp_gcd(a.n, b.d)
+        g2 = _sp_gcd(b.n, a.d)
+        n1, d2 = (a.n, b.d) if g1.is_const() else (_exq(a.n, g1), _exq(b.d, g1))
+        n2, d1 = (b.n, a.d) if g2.is_const() else (_exq(b.n, g2), _exq(a.d, g2))
+        return _SR(_pmul(n1, n2), _pmul(d1, d2), 1)
+
+    def recip(self):
+        if not self.n.t:
+            raise CalcError("Division by zero.")
+        num, den = self.d, self.n
+        for _ in range(30):
+            if len(den.t) == 1:
+                (m, _c), = den.t.items()
+                fix = None
+                for k, e in m:
+                    at = _ATOMS[k]
+                    if at.kind == 'rt':
+                        f = _SP.atom(k, at.b - e)
+                        fix = f if fix is None else fix * f
+                if fix is None:
+                    break
+                num, den = _red(num * fix), _red(den * fix)
+                continue
+            quads = [k for k in den.atoms() if _quad_sq(_ATOMS[k]) is not None and not _ATOMS[k].var]
+            if not quads:
+                break
+            k = min(quads)
+            cd = _split_var(den, k)
+            if max(cd) != 1:
+                break
+            conj = cd.get(0, _SP()) - cd[1] * _SP.atom(k)
+            num, den = _red(num * conj), _red(den * conj)
+        return _SR(num, den)
+
+    def __truediv__(a, b):
+        return a * b.recip()
+
+    def __pow__(a, k):
+        if k < 0:
+            return (a ** -k).recip()
+        if k > _SYM_MAXPOW:
+            raise _SymError("The exponent is too large.")
+        r, base = _SR.const(1), a
+        while k:
+            if k & 1: r = r * base
+            k >>= 1
+            if k: base = base * base
+        return r
+
+    def __eq__(self, o):
+        return isinstance(o, _SR) and self.n == o.n and self.d == o.d
+
+    def __hash__(self):
+        return hash((self.n, self.d))
+
+    def canon(self):
+        return f"{self.n.canon()}|{self.d.canon()}"
+
+class _SymTimeout(Exception):
+    pass
+
+
+_DEADLINE = [0.0]
+
+
+def _tick():
+    if time.monotonic() > _DEADLINE[0]:
+        raise _SymTimeout()
+
+
+# ---- factoring: whole-number polynomials in one variable are lists of ints, lowest degree first ----
+
+def _u_trim(a):
+    while a and a[-1] == 0: a.pop()
+    return a
+
+
+def _u_content(a):
+    g = 0
+    for c in a: g = math.gcd(g, c)
+    return g
+
+
+def _u_pp(a):
+    g = _u_content(a)
+    if not g: return list(a)
+    a = [c // g for c in a]
+    return [-c for c in a] if a[-1] < 0 else a
+
+
+def _u_mul(a, b):
+    if not a or not b: return []
+    r = [0] * (len(a) + len(b) - 1)
+    for i, x in enumerate(a):
+        if x:
+            for j, y in enumerate(b):
+                r[i + j] += x * y
+    return r
+
+
+def _u_sub(a, b):
+    n = max(len(a), len(b))
+    return _u_trim([(a[i] if i < len(a) else 0) - (b[i] if i < len(b) else 0) for i in range(n)])
+
+
+def _u_deriv(a):
+    return _u_trim([i * a[i] for i in range(1, len(a))])
+
+
+def _u_exquo(a, b):
+    """a / b over the integers when b divides a, else None."""
+    if not b: return None
+    a = list(a)
+    db, lb = len(b) - 1, b[-1]
+    if len(a) < len(b): return [] if not a else None
+    q = [0] * (len(a) - db)
+    for i in range(len(a) - 1, db - 1, -1):
+        c = a[i]
+        if c == 0: continue
+        if c % lb: return None
+        t = c // lb
+        q[i - db] = t
+        for j in range(len(b)):
+            a[i - db + j] -= t * b[j]
+    return q if not any(a) else None
+
+
+def _u_gcd(a, b):
+    """Primitive gcd over Z, positive leading coefficient."""
+    a, b = _u_pp(a), _u_pp(b)
+    while b:
+        # pseudo-remainder
+        r = list(a)
+        db, lb = len(b) - 1, b[-1]
+        while len(r) >= len(b):
+            lr = r[-1]
+            sh = len(r) - len(b)
+            r = [c * lb for c in r]
+            for j in range(len(b)):
+                r[sh + j] -= lr * b[j]
+            _u_trim(r)
+        a, b = b, _u_pp(r) if r else []
+    return _u_pp(a) if a else []
+
+
+def _u_sqfree(f):
+    """Yun's algorithm: [(g, k)], g square-free primitive, f = product of g^k."""
+    d = _u_deriv(f)
+    a0 = _u_gcd(f, d)
+    if len(a0) <= 1:
+        return [(f, 1)]
+    b = _u_exquo(f, a0)
+    c = _u_exquo(d, a0)
+    dd = _u_sub(c, _u_deriv(b))
+    out, i = [], 1
+    while len(b) > 1:
+        a = _u_gcd(b, dd) if dd else list(b)
+        if len(a) > 1:
+            out.append((_u_pp(a), i))
+        b2 = _u_exquo(b, a)
+        c2 = _u_exquo(dd, a) if dd else []
+        b = b2
+        dd = _u_sub(c2, _u_deriv(b))
+        i += 1
+    return out
+
+
+# polynomials modulo a prime p
+
+def _m_trim(a):
+    while a and a[-1] == 0: a.pop()
+    return a
+
+
+def _m_sub(a, b, p):
+    n = max(len(a), len(b))
+    return _m_trim([((a[i] if i < len(a) else 0) - (b[i] if i < len(b) else 0)) % p for i in range(n)])
+
+
+def _m_add(a, b, p):
+    n = max(len(a), len(b))
+    return _m_trim([((a[i] if i < len(a) else 0) + (b[i] if i < len(b) else 0)) % p for i in range(n)])
+
+
+def _m_mul(a, b, p):
+    if not a or not b: return []
+    r = [0] * (len(a) + len(b) - 1)
+    for i, x in enumerate(a):
+        if x:
+            for j, y in enumerate(b):
+                r[i + j] += x * y
+    return _m_trim([c % p for c in r])
+
+
+def _m_divmod(a, b, p):
+    a = [c % p for c in a]
+    db = len(b) - 1
+    inv = pow(b[-1], -1, p)
+    q = [0] * max(len(a) - db, 0)
+    for i in range(len(a) - 1, db - 1, -1):
+        c = a[i] % p
+        if c:
+            t = c * inv % p
+            q[i - db] = t
+            for j in range(len(b)):
+                a[i - db + j] = (a[i - db + j] - t * b[j]) % p
+    return _m_trim(q), _m_trim(a[:db] if db > 0 else [])
+
+
+def _m_monic(a, p):
+    if not a: return a
+    inv = pow(a[-1], -1, p)
+    return [c * inv % p for c in a]
+
+
+def _m_gcd(a, b, p):
+    a, b = _m_trim(list(a)), _m_trim(list(b))
+    while b:
+        a, b = b, _m_divmod(a, b, p)[1]
+    return _m_monic(a, p)
+
+
+def _m_powmod(base, e, mod, p):
+    r, b = [1], _m_divmod(base, mod, p)[1]
+    while e:
+        if e & 1: r = _m_divmod(_m_mul(r, b, p), mod, p)[1]
+        e >>= 1
+        if e: b = _m_divmod(_m_mul(b, b, p), mod, p)[1]
+    return r
+
+
+def _m_egcd(a, b, p):
+    """(g, s, t) with s*a + t*b = g (monic gcd) modulo p."""
+    r0, r1 = _m_trim(list(a)), _m_trim(list(b))
+    s0, s1, t0, t1 = [1], [], [], [1]
+    while r1:
+        q, r = _m_divmod(r0, r1, p)
+        r0, r1 = r1, r
+        s0, s1 = s1, _m_sub(s0, _m_mul(q, s1, p), p)
+        t0, t1 = t1, _m_sub(t0, _m_mul(q, t1, p), p)
+    inv = pow(r0[-1], -1, p)
+    return [c * inv % p for c in r0], [c * inv % p for c in s0], [c * inv % p for c in t0]
+
+
+def _m_ddf(f, p):
+    """Distinct-degree factorisation of a monic square-free f: [(product of the factors of degree d, d)]."""
+    out, h, d, fs = [], [0, 1], 0, f
+    while len(fs) - 1 >= 2 * (d + 1):
+        d += 1
+        h = _m_powmod(h, p, fs, p)
+        g = _m_gcd(_m_sub(h, [0, 1], p), fs, p)
+        if len(g) > 1:
+            out.append((g, d))
+            fs = _m_divmod(fs, g, p)[0]
+            h = _m_divmod(h, fs, p)[1]
+    if len(fs) > 1:
+        out.append((fs, len(fs) - 1))
+    return out
+
+
+def _m_edf(f, d, p, rng):
+    """Split a monic product of irreducibles that all have degree d (p odd)."""
+    n = len(f) - 1
+    if n == d:
+        return [f]
+    while True:
+        _tick()
+        a = _m_trim([rng.randrange(p) for _ in range(n)])
+        if len(a) < 2: continue
+        g = _m_gcd(a, f, p)
+        if not (1 < len(g) < len(f)):
+            b = _m_powmod(a, (p ** d - 1) // 2, f, p)
+            g = _m_gcd(_m_sub(b, [1], p), f, p)
+        if 1 < len(g) < len(f):
+            return _m_edf(g, d, p, rng) + _m_edf(_m_divmod(f, g, p)[0], d, p, rng)
+
+
+def _m_factor(f, p, rng):
+    out = []
+    for g, d in _m_ddf(f, p):
+        out.extend(_m_edf(g, d, p, rng))
+    return out
+
+
+def _hensel_pair(f, G, H, p, k):
+    """Lift f = lc * G * H (mod p) to modulus p**k; G and H monic and coprime modulo p."""
+    lc = f[-1]
+    lcinv = pow(lc, -1, p)
+    _, s, t = _m_egcd(G, H, p)
+    m = p
+    for _ in range(k - 1):
+        _tick()
+        prod = _u_mul(_u_mul([lc], G), H)
+        diff = _u_sub(f, prod)
+        e = [(c // m) % p * lcinv % p for c in diff]
+        e = _m_trim(e)
+        dG = _m_divmod(_m_mul(t, e, p), G, p)[1]
+        rest = _m_sub(e, _m_mul(dG, H, p), p)
+        dH = _m_divmod(rest, G, p)[0]
+        G = _u_trim([a + m * b for a, b in itertools.zip_longest(G, dG, fillvalue=0)])
+        H = _u_trim([a + m * b for a, b in itertools.zip_longest(H, dH, fillvalue=0)])
+        m *= p
+    return G, H
+
+
+def _hensel(f, facs, p, k):
+    """Lift f = lc * product(facs) (mod p) to modulus p**k; returns monic factors modulo p**k."""
+    mod = p ** k
+    if len(facs) == 1:
+        inv = pow(f[-1], -1, mod)
+        return [[c * inv % mod for c in f]]
+    h = len(facs) // 2
+    left, right = facs[:h], facs[h:]
+    G = [1]
+    for g in left: G = _m_mul(G, g, p)
+    H = [1]
+    for g in right: H = _m_mul(H, g, p)
+    G2, H2 = _hensel_pair(f, G, H, p, k)
+    G2 = [c % mod for c in G2]
+    H2 = [c % mod for c in H2]
+    return _hensel(G2, left, p, k) + _hensel(H2, right, p, k)
+
+
+_PRIMES = (3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73)
+
+
+def _uz_irreducible_split(f):
+    """Factor a square-free primitive f (positive leading coefficient, degree >= 2) over Z."""
+    n = len(f) - 1
+    lc = f[-1]
+    rng = random.Random(20240607)
+    best = None
+    tried = 0
+    for p in _PRIMES:
+        if lc % p == 0: continue
+        fp = _m_monic([c % p for c in f], p)
+        if len(_m_gcd(fp, _m_trim([i * fp[i] % p for i in range(1, len(fp))]), p)) > 1:
+            continue
+        facs = _m_factor(fp, p, rng)
+        tried += 1
+        if best is None or len(facs) < len(best[1]):
+            best = (p, facs)
+        if len(facs) == 1 or tried >= 6:
+            break
+    if best is None:
+        return [f]
+    p, facs = best
+    if len(facs) == 1:
+        return [f]
+    if len(facs) > 18:
+        return [f]
+    norm = math.isqrt(sum(c * c for c in f)) + 1
+    bound = 2 * abs(lc) * (2 ** n) * norm + 1
+    k = 1
+    while p ** k <= bound: k += 1
+    lifted = _hensel(f, facs, p, k)
+    mod = p ** k
+    half = mod // 2
+    idx = list(range(len(lifted)))
+    cur = list(f)
+    found = []
+    size = 1
+    while 2 * size <= len(idx):
+        again = True
+        while again and 2 * size <= len(idx):
+            again = False
+            for T in itertools.combinations(idx, size):
+                _tick()
+                g = [cur[-1] % mod]
+                for i in T:
+                    g = [c % mod for c in _u_mul(g, lifted[i])]
+                g = [c - mod if c > half else c for c in g]
+                g = _u_pp(_u_trim(g))
+                if len(g) < 2: continue
+                q = _u_exquo(cur, g)
+                if q is not None:
+                    found.append(g)
+                    cur = _u_pp(q)
+                    idx = [i for i in idx if i not in T]
+                    again = True
+                    break
+        size += 1
+    if len(cur) > 1:
+        found.append(_u_pp(cur))
+    return found
+
+
+def _uz_factor(f):
+    """Irreducible factors of a primitive integer polynomial (positive leading coefficient) in one
+    variable: [(g, multiplicity)], g primitive with positive leading coefficient."""
+    out = []
+    for g, k in _u_sqfree(f):
+        if len(g) <= 2:
+            out.append((g, k))
+        else:
+            for h in _uz_irreducible_split(g):
+                out.append((h, k))
+    return out
+
+
+def _sp_to_uni(p, x):
+    cd = _split_var(p, x)
+    n = max(cd) + 1
+    out = [0] * n
+    for e, cp in cd.items():
+        out[e] = int(cp.cval())
+    return out
+
+
+def _sp_from_uni(a, x):
+    return _SP({(((x, i),) if i else ()): Fraction(c) for i, c in enumerate(a) if c})
+
+
+def _sp_degree_in(p, x):
+    d = 0
+    for m in p.t:
+        for k, e in m:
+            if k == x and e > d: d = e
+    return d
+
+
+def _kron(p, gens, D):
+    """Substitute gens[j] = t^(D**j): a multivariate polynomial becomes a univariate one."""
+    out = {}
+    idx = {g: D ** j for j, g in enumerate(gens)}
+    for m, c in p.t.items():
+        e = sum(ex * idx[k] for k, ex in m)
+        out[e] = int(c)
+    n = max(out) + 1
+    a = [0] * n
+    for e, c in out.items(): a[e] = c
+    return a
+
+
+def _unkron(a, gens, D):
+    t = {}
+    for e, c in enumerate(a):
+        if not c: continue
+        m, r = [], e
+        for g in gens:
+            r, d = divmod(r, D)
+            if d: m.append((g, d))
+        t[tuple(m)] = Fraction(c)
+    return _SP(t)
+
+
+def _factor_multi(P, gens):
+    """Irreducible factors [(poly, mult)] of an integer polynomial in several atoms, with no monomial
+    factor. Kronecker's substitution reduces it to one variable; candidates are checked by division."""
+    D = 1 + max(_sp_degree_in(P, g) for g in gens)
+    a = _kron(P, gens, D)
+    if len(a) > _SYM_MAXDEG:
+        return [(P, 1)]
+    zeros = 0
+    while a[zeros] == 0: zeros += 1
+    core = a[zeros:]
+    irr = []
+    for g, k in _uz_factor(_u_pp(core)):
+        irr.extend([g] * k)
+    # distinct factors with their multiplicity
+    distinct = []
+    for g in irr:
+        for item in distinct:
+            if item[0] == g:
+                item[1] += 1
+                break
+        else:
+            distinct.append([g, 1])
+    result = []
+    work = P
+    while True:
+        found = None
+        total = sum(c for _, c in distinct)
+        if total + zeros <= 1:
+            break
+        ranges = [range(c + 1) for _, c in distinct]
+        cands = sorted(itertools.product(*ranges), key=lambda v: sum(v))
+        for combo in cands:
+            n = sum(combo)
+            if n == 0 or n == total and zeros == 0:
+                continue
+            u = [1]
+            for (g, _), c in zip(distinct, combo):
+                for _i in range(c): u = _u_mul(u, g)
+            for s in range(zeros + 1):
+                _tick()
+                if n == total and s == zeros:
+                    continue
+                cand = _unkron([0] * s + u, gens, D)
+                if not cand.t or cand.is_const(): continue
+                if len([1 for m in cand.t if not m]) == 1 and len(cand.t) == 1: continue
+                cp, cq = _sp_split_content(cand)
+                if len(cq.t) == 1: continue
+                q = _sp_exquo(work, cq)
+                if q is not None:
+                    found = (cq, combo)
+                    break
+            if found: break
+        if not found:
+            break
+        G, combo = found
+        mult = 0
+        while True:
+            q = _sp_exquo(work, G)
+            if q is None: break
+            work = q
+            mult += 1
+        result.append((G, mult))
+        # recompute the univariate image of what is left
+        cw, work = _sp_split_content(work)
+        if work.is_const():
+            work = None
+            break
+        gens2 = sorted(work.atoms())
+        mg = _mono_gcd_all(work)
+        if mg:
+            for k, e in mg.items():
+                result.append((_SP.atom(k), e))
+            work = _div_mono(work, mg)
+            if work.is_const():
+                work = None
+                break
+            gens2 = sorted(work.atoms())
+        if len(gens2) == 1:
+            for g, k in _uz_factor(_sp_to_uni(work, gens2[0])):
+                result.append((_sp_from_uni(g, gens2[0]), k))
+            work = None
+            break
+        D = 1 + max(_sp_degree_in(work, g) for g in gens2)
+        gens = gens2
+        a = _kron(work, gens, D)
+        if len(a) > _SYM_MAXDEG:
+            break
+        zeros = 0
+        while a[zeros] == 0: zeros += 1
+        core = a[zeros:]
+        irr = []
+        for g, k in _uz_factor(_u_pp(core)):
+            irr.extend([g] * k)
+        distinct = []
+        for g in irr:
+            for item in distinct:
+                if item[0] == g:
+                    item[1] += 1
+                    break
+            else:
+                distinct.append([g, 1])
+    if work is not None and not work.is_const():
+        result.append((work, 1))
+    return result
+
+
+def _mono_gcd_all(p):
+    it = iter(p.t)
+    g = dict(next(it))
+    for m in it:
+        d = dict(m)
+        for k in list(g):
+            if k in d: g[k] = min(g[k], d[k])
+            else: del g[k]
+        if not g: return {}
+    return g
+
+
+def _div_mono(p, mg):
+    m0 = tuple(sorted(mg.items()))
+    return _SP({_mono_div(m, m0): c for m, c in p.t.items()})
+
+
+def _sp_deriv(p, x):
+    t = {}
+    for m, c in p.t.items():
+        for i, (k, e) in enumerate(m):
+            if k == x:
+                nm = m[:i] + (((k, e - 1),) if e > 1 else ()) + m[i + 1:]
+                t[nm] = t.get(nm, 0) + c * e
+    return _SP({m: c for m, c in t.items() if c})
+
+
+def _sqfree_multi(P):
+    """P (whole-number coefficients, content 1) as [(g, k)]: g square-free, pairwise coprime, P = product g^k."""
+    gens = sorted(P.atoms())
+    if not gens:
+        return []
+    x = gens[0]
+    cd = _split_var(P, x)
+    cont = _content_x(cd)
+    out = []
+    if not cont.is_const():
+        cc, cpart = _sp_split_content(cont)
+        out.extend(_sqfree_multi(cpart))
+    pp = _join_var({e: _sp_exquo(cp, cont) for e, cp in cd.items()}, x) if not cont.is_const() else P
+    if _sp_degree_in(pp, x) == 0:
+        return out + ([(pp, 1)] if not pp.is_const() else [])
+    d = _sp_deriv(pp, x)
+    a0 = _sp_gcd(pp, d)
+    if a0.is_const():
+        return out + [(pp, 1)]
+    b = _sp_exquo(pp, a0)
+    c = _sp_exquo(d, a0)
+    dd = c - _sp_deriv(b, x)
+    i = 1
+    while not b.is_const():
+        a = _sp_gcd(b, dd) if dd.t else b
+        if not a.is_const():
+            out.append((_sp_split_content(a)[1], i))
+        b2 = _sp_exquo(b, a)
+        c2 = _sp_exquo(dd, a) if dd.t else _SP()
+        b = b2
+        dd = c2 - _sp_deriv(b, x)
+        i += 1
+    return out
+
+
+def _linear_irreducible(P, gens):
+    """True when P is linear in some atom and its two coefficients have no common factor."""
+    for g in gens:
+        cd = _split_var(P, g)
+        if max(cd) == 1 and set(cd) <= {0, 1}:
+            if _sp_gcd(cd[1], cd.get(0, _SP())).is_const():
+                return True
+    return False
+
+
+def _sp_factor(P):
+    """P = c * product(f**k): (c, [(f, k)]); the factors are polynomials with whole-number coefficients."""
+    _DEADLINE[0] = time.monotonic() + 3.0
+    try:
+        return _sp_factor_work(P)
+    except _SymTimeout:
+        return Fraction(1), [(P, 1)]
+
+
+def _sp_factor_work(P):
+    if not P.t:
+        return Fraction(0), []
+    c, ip = _sp_split_content(P)
+    items = []
+    mg = _mono_gcd_all(ip)
+    if mg:
+        for k, e in mg.items():
+            items.append((_SP.atom(k), e))
+        ip = _div_mono(ip, mg)
+    if ip.is_const():
+        return c * ip.cval(), items
+    gens = sorted(ip.atoms())
+    if len(gens) == 1:
+        for g, k in _uz_factor(_sp_to_uni(ip, gens[0])):
+            items.append((_sp_from_uni(g, gens[0]), k))
+    else:
+        for part, mult in _sqfree_multi(ip):
+            pg = sorted(part.atoms())
+            if len(pg) == 1:
+                for g, k in _uz_factor(_sp_to_uni(part, pg[0])):
+                    items.append((_sp_from_uni(g, pg[0]), k * mult))
+            elif not pg:
+                continue
+            elif _linear_irreducible(part, pg):
+                items.append((part, mult))
+            else:
+                for g, k in _factor_multi(part, pg):
+                    items.append((g, k * mult))
+    merged = []
+    for g, k in items:
+        for it in merged:
+            if it[0] == g:
+                it[1] += k
+                break
+        else:
+            merged.append([g, k])
+    prod = _SP.const(1)
+    for g, k in merged:
+        prod = prod * (g ** k)
+    # the factors may carry signs of their own: fix the constant by comparing leading coefficients
+    ratio = P.t[_lead(P)] / prod.t[_lead(prod)]
+    if prod.scale(ratio) != P:
+        return Fraction(1), [(P, 1)]
+    return ratio, [(g, k) for g, k in merged]
+
+# ---- atoms and the rules of the functions ----
+
+_R0 = _SR.const(0)
+_R1 = _SR.const(1)
+
+
+def _rc(c):
+    return _SR.const(Fraction(c))
+
+
+def _a_sym(name, const=False):
+    return _SR.atom(_atom('s:' + name, 'sym', name, const, not const, 0, 1 if const else 0).key)
+
+
+def _a_unit(name):
+    return _SR.atom(_atom('u:' + name, 'unit', name, None, False, 2, 1).key)
+
+
+def _any_var(*rs):
+    return any(_ATOMS[k].var for r in rs for k in r.atoms())
+
+
+def _a_fn(name, args):
+    key = 'f:' + name + '(' + ','.join(a.canon() for a in args) + ')'
+    return _SR.atom(_atom(key, 'fn', name, tuple(args), _any_var(*args),
+                          2 if name == 'abs' and _real_expr(args[0]) else 0, 2).key)
+
+
+def _a_pow(base, ex):
+    key = 'p:' + base.canon() + '^' + ex.canon()
+    return _SR.atom(_atom(key, 'pow', base, ex, _any_var(base, ex), 0, 2).key)
+
+
+def _a_rt(poly, d):
+    key = f'r:{d}:' + poly.canon()
+    var = any(_ATOMS[k].var for k in poly.atoms())
+    return _SR.atom(_atom(key, 'rt', poly, d, var, d, 2).key)
+
+
+def _dec_frac(d):
+    """A Decimal as an exact fraction. A long decimal that is a rounded simple fraction (1/3 stored with
+    50 digits) becomes that fraction."""
+    sign, digits, exp = d.as_tuple()
+    n = int(''.join(map(str, digits)) or '0')
+    f = Fraction(n * 10 ** exp) if exp >= 0 else Fraction(n, 10 ** -exp)
+    if sign: f = -f
+    if len(digits) >= 25 and f:
+        g = f.limit_denominator(10 ** 12)
+        if abs(g - f) <= abs(f) * Fraction(1, 10 ** max(ctx.prec - 6, 10)):
+            return g
+    return f
+
+
+def _iroot(n, q):
+    """The whole q-th root of n if there is one, else None."""
+    if n < 2: return n
+    lo, hi = 1, 1 << (n.bit_length() // q + 1)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if mid ** q < n: lo = mid + 1
+        else: hi = mid
+    return lo if lo ** q == n else None
+
+
+def _factorize(n):
+    """{prime: exponent}; a leftover cofactor beyond trial division is kept whole."""
+    out, p = {}, 2
+    while p * p <= n and p < 100000:
+        while n % p == 0:
+            out[p] = out.get(p, 0) + 1
+            n //= p
+        p += 1 if p == 2 else 2
+    if n > 1:
+        out[n] = out.get(n, 0) + 1
+    return out
+
+
+def _main_unit():
+    if not _ACTIVE_UNITS:
+        raise CalcError("No real solutions.")
+    return _a_unit(_UNIT_KEYS[_ACTIVE_UNITS[0]])
+
+
+def _num_root(c, q):
+    """c ** (1/q) for a rational number c, as an exact expression."""
+    if c == 0: return _R0
+    if c < 0:
+        if q != 2:
+            raise _SymError("A root of a negative number.")
+        return _num_root(-c, 2) * _main_unit()
+    a, b = c.numerator, c.denominator
+    n = a * b ** (q - 1)
+    out, res = 1, _R1
+    for p, e in _factorize(n).items():
+        if p > 100000:
+            r = _iroot(p ** e, q)
+            if r is not None:
+                out *= r
+                continue
+        out *= p ** (e // q)
+        if e % q:
+            res = res * (_a_rt(_SP.const(p), q) ** (e % q))
+    return _rc(Fraction(out, b)) * res
+
+
+def _single_atom(r):
+    """(atom, exponent) when r is exactly one atom to a power with coefficient 1, else None."""
+    if r.d.t != {(): Fraction(1)} or len(r.n.t) != 1:
+        return None
+    (m, c), = r.n.t.items()
+    if c != 1 or len(m) != 1:
+        return None
+    return _ATOMS[m[0][0]], m[0][1]
+
+
+_REAL_FNS = {'sin', 'cos', 'tan', 'cot', 'sec', 'csc', 'atan', 'sinh', 'cosh', 'tanh', 'erf', 'erfc', 'abs',
+             'floor', 'ceil', 'sign', 'asinh'}
+
+
+def _real_expr(r):
+    """True when r is certainly a real number (for real variables)."""
+    for k in r.atoms():
+        at = _ATOMS[k]
+        if at.kind == 'sym':
+            continue
+        if at.kind == 'rt' and not at.var and at.a.is_const() and at.a.cval() > 0:
+            continue
+        if at.kind == 'fn' and at.a in _REAL_FNS and all(_real_expr(x) for x in at.b):
+            continue
+        if at.kind == 'pow' and _real_expr(at.b) and _real_expr(at.a):
+            c = at.a.cval()
+            if (c is not None and c > 0) or _is_e(at.a):
+                continue
+        return False
+    return True
+
+
+def _abs_atom(k):
+    """abs() of one atom."""
+    at = _ATOMS[k]
+    if at.kind == 'unit': return _R1
+    if at.kind == 'sym' and at.b: return _SR.atom(k)
+    if at.kind == 'rt' and not at.var: return _SR.atom(k)
+    if at.kind == 'pow' and _real_expr(at.b):
+        b = at.a.cval()
+        if (b is not None and b > 0) or (_single_atom(at.a) and _single_atom(at.a)[0].key == 's:e'):
+            return _SR.atom(k)
+    return _a_fn('abs', [_SR.atom(k)])
+
+
+def _r_abs(r):
+    c = r.cval()
+    if c is not None:
+        return _rc(abs(c))
+    if r.d.t != {(): Fraction(1)}:
+        return _r_abs(_SR(r.n, None, 0)) / _r_abs(_SR(r.d, None, 0))
+    P = r.n
+    if len(P.t) == 1:
+        (m, c), = P.t.items()
+        out = _rc(abs(c))
+        for k, e in m:
+            out = out * (_abs_atom(k) ** e)
+        return out
+    if P.t[_lead(P)] < 0:
+        P = -P
+    return _a_fn('abs', [_SR(P, None, 0)])
+
+
+def _r_root(r, q):
+    """r ** (1/q) for a whole number q >= 2 (the principal root)."""
+    c = r.cval()
+    if c is not None:
+        return _num_root(c, q)
+    if r.d.t != {(): Fraction(1)}:
+        top = _r_root(_SR(_pmul(r.n, r.d ** (q - 1)), None, 0), q)
+        dr = _r_abs(_SR(r.d, None, 0)) if q % 2 == 0 else _SR(r.d, None, 0)
+        return top / dr
+    P = r.n
+    cc, ip = _sp_split_content(P)
+    g = abs(cc)
+    out = _num_root(g, q)
+    P = P.scale(1 / g)
+    if len(P.t) == 1:
+        (m, c0), = P.t.items()
+        sign = 1 if c0 > 0 else -1
+        keep = []
+        for k, e in m:
+            qq, rr = divmod(e, q)
+            if qq:
+                out = out * ((_abs_atom(k) if q % 2 == 0 else _SR.atom(k)) ** qq)
+            if rr: keep.append((k, rr))
+        rad = _SP({tuple(keep): Fraction(sign)})
+        if not keep:
+            return out * (_R1 if sign > 0 else _num_root(Fraction(-1), q))
+    else:
+        rad = P
+    one = _single_atom(_SR(rad, None, 0))
+    if one is not None and one[0].kind == 'rt' and one[1] == 1:
+        return out * _a_rt(one[0].a, one[0].b * q)
+    return out * _a_rt(rad, q)
+
+
+def _is_e(r):
+    s = _single_atom(r)
+    return s is not None and s[0].key == 's:e' and s[1] == 1
+
+
+def _r_pow(base, ex):
+    e = ex.cval()
+    if e is not None:
+        if e.denominator == 1:
+            n = int(e)
+            if not base.n.t:
+                if n <= 0: raise CalcError("Division by zero.")
+                return _R0
+            if abs(n) > _SYM_MAXPOW:
+                raise _SymError("The exponent is too large.")
+            return base ** n
+        if not base.n.t:
+            if e < 0: raise CalcError("Division by zero.")
+            return _R0
+        return _r_root(base, e.denominator) ** e.numerator
+    bc = base.cval()
+    if bc == 1:
+        return _R1
+    if ex.d.t != {(): Fraction(1)}:
+        return _a_pow(base, ex)
+    out = _R1
+    for mono, coef in ex.n.t.items():
+        if not mono:
+            out = out * _r_pow(base, _rc(coef))
+            continue
+        term = _SR(_SP({mono: Fraction(1)}), None, 0)
+        s = _single_atom(term)
+        if _is_e(base) and s is not None and s[0].kind == 'fn' and s[0].a == 'ln' and s[1] == 1:
+            out = out * _r_pow(s[0].b[0], _rc(coef))
+            continue
+        if coef.denominator == 1:
+            out = out * (_a_pow(base, term) ** int(coef))
+        elif coef > 0:
+            out = out * _a_pow(base, _SR(_SP({mono: coef}), None, 0))
+        else:
+            out = out / _a_pow(base, _SR(_SP({mono: -coef}), None, 0))
+    return out
+
+
+def _r_exp(a):
+    return _r_pow(_a_sym('e', True), a)
+
+
+def _r_ln(r):
+    c = r.cval()
+    if c is not None:
+        if c <= 0:
+            raise _SymError("The logarithm of a number that is not positive.")
+        if c == 1: return _R0
+        out = _R0
+        for num, sgn in ((c.numerator, 1), (c.denominator, -1)):
+            for p, e in _factorize(num).items():
+                out = out + _rc(sgn * e) * _a_fn('ln', [_rc(p)])
+        return out
+    s = _single_atom(r)
+    if s is not None:
+        at, k = s
+        if at.key == 's:e':
+            return _rc(k)
+        if at.kind == 'pow' and k == 1 and _is_e(at.a):
+            return at.b
+    return _a_fn('ln', [r])
+
+
+# ---- trigonometry ----
+
+def _sq(n):
+    return _num_root(Fraction(n), 2)
+
+
+def _trig_table():
+    h = _rc(Fraction(1, 2))
+    q = _rc(Fraction(1, 4))
+    s6, s2, s3 = _sq(6), _sq(2), _sq(3)
+    return [
+        (_R0, _R1),
+        ((s6 - s2) * q, (s6 + s2) * q),
+        (h, s3 * h),
+        (s2 * h, s2 * h),
+        (s3 * h, h),
+        ((s6 + s2) * q, (s6 - s2) * q),
+    ]
+
+
+_TRIG_TABLE = []
+
+
+def _pi_atom():
+    return _a_sym('pi', True)
+
+
+def _split_pi(r):
+    """r = rest + q*pi with q a Fraction: (rest, q)."""
+    if r.d.t != {(): Fraction(1)}:
+        return r, Fraction(0)
+    key = ((('s:pi', 1),))
+    q = r.n.t.get(key, Fraction(0))
+    if not q:
+        return r, Fraction(0)
+    rest = _SP({m: c for m, c in r.n.t.items() if m != key})
+    return _SR(rest, None, 0), q
+
+
+def _sin_cos_at(k):
+    """sin and cos of k*pi/12 (k any whole number)."""
+    if not _TRIG_TABLE:
+        _TRIG_TABLE.extend(_trig_table())
+    k %= 24
+    qd, rr = divmod(k, 6)
+    s, c = _TRIG_TABLE[rr]
+    return [(s, c), (c, -s), (-s, -c), (-c, s)][qd]
+
+
+_ODD  = {'sin', 'tan', 'cot', 'csc', 'asin', 'atan', 'sinh', 'tanh', 'coth', 'csch', 'asinh', 'atanh', 'erf', 'sign'}
+_EVEN = {'cos', 'sec', 'cosh', 'sech'}
+_OPAQUE = _ODD | _EVEN | {'acos', 'acot', 'asec', 'acsc', 'acosh', 'asech', 'acsch', 'acoth', 'gamma', 'digamma',
+                          'erfc', 'floor', 'ceil', 'zeta', 'lgamma', 'sinc', 'trunc'}
+_INV_VALUES = {
+    'asin': {Fraction(0): Fraction(0), Fraction(1, 2): Fraction(1, 6), Fraction(1): Fraction(1, 2)},
+    'acos': {Fraction(1): Fraction(0), Fraction(1, 2): Fraction(1, 3), Fraction(0): Fraction(1, 2)},
+    'atan': {Fraction(0): Fraction(0), Fraction(1): Fraction(1, 4)},
+}
+
+
+def _lead_neg(r):
+    return r.n.t[_lead(r.n)] < 0
+
+
+def _r_func(name, r):
+    """A function of one expression, evaluated exactly where that is possible."""
+    c = r.cval()
+    pi = _pi_atom()
+    if name in ('sin', 'cos', 'tan', 'cot', 'sec', 'csc'):
+        rest, q = _split_pi(r)
+        if rest.is_zero() and (q * 12).denominator == 1:
+            s, co = _sin_cos_at(int(q * 12))
+            if name == 'sin': return s
+            if name == 'cos': return co
+            if name == 'tan': return s / co
+            if name == 'cot': return co / s
+            if name == 'sec': return _R1 / co
+            return _R1 / s
+        if not rest.is_zero() and (q * 2).denominator == 1 and q:
+            n = int(q * 2) % 4
+            if name in ('sin', 'cos'):
+                s_, c_ = _r_func('sin', rest), _r_func('cos', rest)
+                if name == 'sin': return [s_, c_, -s_, -c_][n]
+                return [c_, -s_, -c_, s_][n]
+            if name in ('sec', 'csc'):
+                return _R1 / _r_func('cos' if name == 'sec' else 'sin', r)
+            if n % 2 == 0:
+                return _r_func(name, rest)
+        if c is None and not rest.is_zero() and q and name in ('tan', 'cot') and q.denominator == 1:
+            return _r_func(name, rest)
+    if name in _ODD or name in _EVEN:
+        if c == 0:
+            if name in ('sin', 'tan', 'asin', 'atan', 'sinh', 'tanh', 'asinh', 'atanh', 'erf', 'sign'):
+                return _R0
+            if name in ('cos', 'cosh', 'sec', 'sech'):
+                return _R1
+        if c is None and _lead_neg(r):
+            v = _r_func(name, -r)
+            return -v if name in _ODD else v
+    if name in _INV_VALUES and c is not None:
+        tab = _INV_VALUES[name]
+        if abs(c) in tab:
+            v = _rc(tab[abs(c)]) * pi
+            if c >= 0:
+                return v
+            return -v if name != 'acos' else pi - v
+    s = _single_atom(r)
+    if s is not None and s[0].kind == 'fn' and s[1] == 1 and len(s[0].b) == 1:
+        inner, a = s[0].a, s[0].b[0]
+        if (name, inner) in (('sin', 'asin'), ('cos', 'acos'), ('tan', 'atan'), ('sinh', 'asinh'),
+                             ('cosh', 'acosh'), ('tanh', 'atanh')):
+            return a
+        if (name, inner) in (('sin', 'acos'), ('cos', 'asin')):
+            return _r_root(_R1 - a * a, 2)
+    if c is not None and name not in ('sin', 'cos', 'tan', 'cot', 'sec', 'csc'):
+        v = _closed_call(name, [c])
+        if v is not None:
+            return _rc(v)
+    return _a_fn(name, [r])
+
+
+def _closed_call(name, args):
+    """Evaluate name(args) with the ordinary engine when the answer is a whole number or a short decimal."""
+    txt = f"{name}({', '.join('(' + str(a.numerator) + '/' + str(a.denominator) + ')' for a in args)})"
+    try:
+        v = cal(txt, {}, nodisplay=True)
+    except Exception:
+        return None
+    if isinstance(v, dec) and v.is_finite():
+        if v == v.to_integral_value():
+            return Fraction(int(v))
+        if len(v.as_tuple().digits) <= 12:
+            return _dec_frac(v)
+    return None
+
+
+# ---- the Pythagorean identities ----
+
+_PYTH = (('sin', 'cos', -1), ('sinh', 'cosh', 1))
+
+
+def _poly_size(p):
+    return sum(1 + sum(e for _, e in m) for m in p.t)
+
+
+def _pyth_reduce_poly(p):
+    """Try sin^2 = 1 - cos^2 (and the reverse), cosh^2 - sinh^2 = 1: keep the shortest form."""
+    best = p
+    seen = set()
+    for key in list(p.atoms()):
+        at = _ATOMS[key]
+        if at.kind != 'fn' or len(at.b) != 1:
+            continue
+        for f1, f2, sgn in _PYTH:
+            if at.a not in (f1, f2):
+                continue
+            arg = at.b[0]
+            k1 = _a_fn(f1, [arg]).n.t and next(iter(_a_fn(f1, [arg]).n.t))[0][0]
+            k2 = next(iter(_a_fn(f2, [arg]).n.t))[0][0]
+            if (k1, k2) in seen:
+                continue
+            seen.add((k1, k2))
+            for a, b in ((k1, k2), (k2, k1)):
+                if sgn == -1:
+                    rep = _SP.const(1) - _SP.atom(b, 2)
+                elif a == k2:
+                    rep = _SP.const(1) + _SP.atom(b, 2)
+                else:
+                    rep = _SP.atom(b, 2) - _SP.const(1)
+                cand = _pyth_subst(best, a, rep)
+                if _poly_size(cand) < _poly_size(best):
+                    best = cand
+    return best
+
+
+def _pyth_subst(p, a, rep):
+    out = _SP()
+    for m, c in p.t.items():
+        e = dict(m).get(a, 0)
+        if e < 2:
+            out = out + _SP({m: c})
+            continue
+        rest = tuple((k, x) for k, x in m if k != a)
+        if e % 2:
+            rest = _mono_mul(rest, ((a, 1),))
+        out = out + (_SP({rest: c}) * (rep ** (e // 2)))
+    return out
+
+
+def _pyth(r):
+    n, d = _pyth_reduce_poly(r.n), _pyth_reduce_poly(r.d)
+    if n is r.n and d is r.d:
+        return r
+    return _SR(_red(n), _red(d))
+
+# ---- from the calculator's syntax tree to an expression ----
+
+_SYM_NAMED = ('pi', 'e', 'euler', 'catalan')
+
+
+def _s_named_constant(name):
+    if name in _SYM_NAMED: return _a_sym(name, True)
+    if name == 'tau':      return _rc(2) * _a_sym('pi', True)
+    if name == 'phi':      return (_R1 + _sq(5)) * _rc(Fraction(1, 2))
+    if name == 'sqrt2':    return _sq(2)
+    if name == 'sqrt3':    return _sq(3)
+    if name == 'ln2':      return _r_ln(_rc(2))
+    if name == 'ln10':     return _r_ln(_rc(10))
+    return None
+
+
+def _s_complex(parts):
+    """{unit-product mask: Decimal} -> expression."""
+    out = _R0
+    for mask, c in parts.items():
+        term = _rc(_dec_frac(c))
+        for b in _mask_bits(mask):
+            term = term * _a_unit(_UNIT_KEYS[b])
+        out = out + term
+    return out
+
+
+def _s_value(v, env, info):
+    if isinstance(v, _SR): return v
+    if isinstance(v, bool) or isinstance(v, _Bool): raise _SymError("A truth value.")
+    if isinstance(v, dec): return _rc(_dec_frac(v))
+    if isinstance(v, (mpmath.mpf, int)): return _rc(_dec_frac(dec(str(v))))
+    if isinstance(v, (mpmath.mpc, ImgNum)):
+        parts = _img_parts(v)
+        if parts is None: raise _SymError("A number that cannot be used.")
+        return _s_complex(parts)
+    if isinstance(v, Lambda):
+        info['lam'] = True
+        return _s_body(v, env, info)
+    raise _SymError("A value that is not a number or an expression.")
+
+
+def _s_body(lam, env, info, args=None):
+    info['depth'] = info.get('depth', 0) + 1
+    if info['depth'] > 40:
+        raise _SymError("Functions that use each other.")
+    env2 = {k: v for k, v in env.items() if k not in lam.params}
+    if args is not None:
+        for p, a in zip(lam.params, args):
+            env2[p] = a
+    try:
+        return _s_expr(lam.expr, env2, info)
+    finally:
+        info['depth'] -= 1
+
+
+def _s_ast(text, env):
+    tokens = get_clean_tokens(text)
+    if not tokens:
+        raise _SymError("Nothing to calculate.")
+    src = _group_tokens(tokens, 0, len(tokens), env)
+    return _DecToLit().visit(ast.parse(src, mode='eval').body)
+
+
+def _s_expr(text, env, info):
+    try:
+        node = _s_ast(text, env)
+    except SyntaxError:
+        raise _SymError("Invalid syntax.")
+    return _s_conv(node, env, info)
+
+
+def _s_name(name, env, info):
+    if name in env:
+        return _s_value(env[name], env, info)
+    if _unit_active_key(name):
+        return _a_unit(name)
+    c = _s_named_constant(name)
+    if c is not None: return c
+    if name in dco:
+        v = dco[name]
+        if callable(v) or isinstance(v, (bool, _Bool)): raise _SymError(f"'{name}' is a function.")
+        if isinstance(v, (dec, mpmath.mpf)):
+            return _rc(_dec_frac(dec(mpmath.nstr(v, ctx.prec)) if isinstance(v, mpmath.mpf) else v))
+        raise _SymError("A constant that cannot be used.")
+    info.setdefault('free', set()).add(name)
+    return _a_sym(name)
+
+
+_SQRT_LIKE = {'sqrt': 2, 'cbrt': 3}
+
+
+def _s_call(node, env, info):
+    if not isinstance(node.func, ast.Name) or node.keywords:
+        raise _SymError("A call that cannot be used.")
+    fn = node.func.id
+    if fn == 'Lambda' and len(node.args) == 1 and isinstance(node.args[0], ast.Constant) \
+            and isinstance(node.args[0].value, str):
+        info['lam'] = True
+        return _s_body(Lambda(node.args[0].value), env, info)
+    args = [_s_conv(a, env, info) for a in node.args]
+    if fn in env and isinstance(env[fn], Lambda):
+        lam = env[fn]
+        if len(args) != len(lam.params):
+            raise _SymError("A function called with the wrong number of arguments.")
+        return _s_body(lam, env, info, args)
+    if fn in env:
+        raise _SymError("Not a function.")
+    n = len(args)
+    if fn in _SQRT_LIKE and n == 1:
+        return _r_root(args[0], _SQRT_LIKE[fn])
+    if fn == 'exp' and n == 1:
+        return _r_exp(args[0])
+    if fn in ('ln', 'log') and n == 1:
+        return _r_ln(args[0])
+    if fn == 'log' and n == 2:
+        return _r_ln(args[0]) / _r_ln(args[1])
+    if fn == 'log2' and n == 1:
+        return _r_ln(args[0]) / _r_ln(_rc(2))
+    if fn == 'log10' and n == 1:
+        return _r_ln(args[0]) / _r_ln(_rc(10))
+    if fn == 'abs' and n == 1:
+        return _r_abs(args[0])
+    if fn in _OPAQUE and n == 1:
+        return _r_func(fn, args[0])
+    consts = [a.cval() for a in args]
+    if fn in dco and callable(dco[fn]) and all(c is not None for c in consts) and n:
+        v = _closed_call(fn, consts)
+        if v is not None:
+            return _rc(v)
+        return _a_fn(fn, args)
+    raise _SymError(f"'{fn}' cannot be used symbolically.")
+
+
+def _s_conv(node, env, info):
+    if isinstance(node, ast.Constant):
+        v = _cv(node)
+        if v is None:
+            raise _SymError("A value that is not a number.")
+        return _rc(_dec_frac(v))
+    if isinstance(node, ast.Name):
+        return _s_name(node.id, env, info)
+    if isinstance(node, ast.UnaryOp):
+        if isinstance(node.op, ast.USub): return -_s_conv(node.operand, env, info)
+        if isinstance(node.op, ast.UAdd): return _s_conv(node.operand, env, info)
+        raise _SymError("An operator that cannot be used.")
+    if isinstance(node, ast.BinOp):
+        a = _s_conv(node.left, env, info)
+        b = _s_conv(node.right, env, info)
+        op = node.op
+        if isinstance(op, ast.Add):  return a + b
+        if isinstance(op, ast.Sub):  return a - b
+        if isinstance(op, ast.Mult): return a * b
+        if isinstance(op, ast.Div):  return a / b
+        if isinstance(op, ast.Pow):  return _r_pow(a, b)
+        ca, cb = a.cval(), b.cval()
+        if ca is not None and cb is not None and cb != 0:
+            if isinstance(op, ast.FloorDiv): return _rc(math.floor(ca / cb))
+            if isinstance(op, ast.Mod):      return _rc(ca - cb * math.floor(ca / cb))
+        raise _SymError("An operator that cannot be used.")
+    if isinstance(node, ast.Call):
+        return _s_call(node, env, info)
+    raise _SymError("Syntax that cannot be used.")
+
+
+# ---- from an expression to text ----
+
+def _tok_count(text):
+    return len(re.findall(r'[A-Za-z_][A-Za-z_0-9]*|\d+|[^\sA-Za-z_0-9]', text))
+
+
+def _p_num(c):
+    return str(c.numerator) if c.denominator == 1 else f"{c.numerator}/{c.denominator}"
+
+
+def _atom_order(k):
+    at = _ATOMS[k]
+    if at.kind in ('sym', 'unit') and not at.var: g = 0
+    elif at.kind == 'rt' and not at.var:          g = 0
+    elif at.kind == 'sym':                        g = 1
+    else:                                         g = 2
+    return (g, _atom_sortname(at))
+
+
+def _atom_sortname(at):
+    if at.kind in ('sym', 'unit'):
+        return _disp_name(at.a)
+    return at.key
+
+
+def _paren_if_needed(text):
+    return text if re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*|\d+(?:/\d+)?', text) else '(' + text + ')'
+
+
+def _atom_text(at, e):
+    """Text and join-kind of an atom raised to the whole power e (> 0)."""
+    if at.kind in ('sym', 'unit'):
+        t = at.a
+        eligible = (len(t) == 1 and t != 'e') or t == 'pi'
+        if e == 1: return t, ('var' if eligible else 'other')
+        return f"{t}^{e}", ('varpow' if eligible else 'other')
+    if at.kind == 'fn':
+        t = at.a + '(' + ', '.join(_s_text(a, 'sum') for a in at.b) + ')'
+        return (t if e == 1 else f"{t}^{e}"), 'other'
+    if at.kind == 'rt':
+        base = _s_poly_text(at.a)
+        if at.b == 2 and e == 1:
+            return f"sqrt({base})", 'other'
+        return f"{_paren_if_needed(base)}^({e}/{at.b})" if e != 1 else f"{_paren_if_needed(base)}^(1/{at.b})", 'other'
+    if at.kind == 'pow':
+        return f"{at.key}", 'other'
+    return at.key, 'other'
+
+
+def _mono_factors(num, den=()):
+    """The factors of a monomial over a monomial: ([(text, kind)], [(text, kind)])."""
+    exps = {}
+    for k, e in num: exps[k] = exps.get(k, 0) + e
+    for k, e in den: exps[k] = exps.get(k, 0) - e
+    ecanon = _a_sym('e', True).canon()
+    groups = {}
+    n_items, d_items = [], []
+    radicands = []
+    for k, e in exps.items():
+        at = _ATOMS[k]
+        if at.kind == 'rt' and at.b == 2 and e == 1 and at.a.is_const() and at.a.cval().denominator == 1 and at.a.cval() > 0:
+            radicands.append(int(at.a.cval()))
+        elif at.kind == 'pow':
+            g = groups.setdefault(at.a.canon(), [at.a, _R0, True])
+            g[1] = g[1] + at.b * _rc(e)
+        elif k == 's:e':
+            g = groups.setdefault(ecanon, [_a_sym('e', True), _R0, False])
+            g[1] = g[1] + _rc(e)
+        elif e > 0:
+            n_items.append((_atom_order(k),) + _atom_text(at, e))
+        elif e < 0:
+            d_items.append((_atom_order(k),) + _atom_text(at, -e))
+    for base, tot, has_pow in groups.values():
+        if tot.is_zero():
+            continue
+        if base.canon() == ecanon:
+            has_pow = any(_ATOMS[k].kind == 'pow' and _is_e(_ATOMS[k].a) for k in exps)
+        if not has_pow:
+            e = int(tot.cval())
+            at = _ATOMS['s:e']
+            (n_items if e > 0 else d_items).append((_atom_order('s:e'),) + _atom_text(at, abs(e)))
+        elif _is_e(base):
+            n_items.append(((2, 'exp'), f"exp({_s_text(tot, 'sum')})", 'other'))
+        else:
+            n_items.append(((2, 'pow'), f"{_paren_if_needed(_s_text(base, 'sum'))}^({_s_text(tot, 'sum')})", 'other'))
+    if radicands:
+        prod = 1
+        for x in radicands: prod *= x
+        n_items.append(((0, 'sqrt'), f"sqrt({prod})", 'other'))
+    n_items.sort(key=lambda it: it[0])
+    d_items.sort(key=lambda it: it[0])
+    return [(t, k) for _, t, k in n_items], [(t, k) for _, t, k in d_items]
+
+
+def _join(parts):
+    out = parts[0][0]
+    for i in range(1, len(parts)):
+        prev, (t, k) = parts[i - 1][1], parts[i]
+        if (prev == 'num' and k in ('var', 'varpow', 'group', 'gpow')) or (prev == 'group' and k == 'group'):
+            out += t
+        else:
+            out += '*' + t
+    return out
+
+
+def _term_text(c, num_f, den_f):
+    """(negative, text) of a term: coefficient c, numerator factors, denominator factors."""
+    a = abs(c)
+    pn = []
+    if a.numerator != 1 or not num_f:
+        pn.append((str(a.numerator), 'num'))
+    pn += num_f
+    pd = []
+    if a.denominator != 1:
+        pd.append((str(a.denominator), 'num'))
+    pd += den_f
+    body = _join(pn)
+    if pd:
+        d = _join(pd)
+        body += '/' + (f"({d})" if len(pd) > 1 else d)
+    return c < 0, body
+
+
+def _term_key(num, den):
+    exps = {}
+    for k, e in num: exps[k] = exps.get(k, 0) + e
+    for k, e in den: exps[k] = exps.get(k, 0) - e
+    exps = {k: e for k, e in exps.items() if e}
+    deg = sum(e for k, e in exps.items() if _ATOMS[k].var)
+    return (-deg, 0 if exps else 1,
+            tuple((_atom_order(k), -e) for k, e in sorted(exps.items(), key=lambda it: _atom_order(it[0]))))
+
+
+def _terms_text(terms):
+    """terms: [(Fraction, num mono, den mono)] -> 'a + b - c'."""
+    if not terms: return '0'
+    recs = sorted(terms, key=lambda t: _term_key(t[1], t[2]))
+    out = []
+    for c, nm, dm in recs:
+        nf, df = _mono_factors(nm, dm)
+        neg, body = _term_text(c, nf, df)
+        if not out:
+            out.append(('-' if neg else '') + body)
+        else:
+            out.append((' - ' if neg else ' + ') + body)
+    return ''.join(out)
+
+
+def _s_poly_text(p):
+    if not p.t: return '0'
+    return _terms_text([(c, m, ()) for m, c in p.t.items()])
+
+
+def _integerize(r):
+    """(n, d) with whole-number coefficients, no common factor, d with a positive leading coefficient."""
+    L = 1
+    for v in list(r.n.t.values()) + list(r.d.t.values()):
+        L = L * v.denominator // math.gcd(L, v.denominator)
+    n, d = r.n.scale(L), r.d.scale(L)
+    g = 0
+    for v in list(n.t.values()) + list(d.t.values()):
+        g = math.gcd(g, int(v))
+    if g > 1:
+        n, d = n.scale(Fraction(1, g)), d.scale(Fraction(1, g))
+    return n, d
+
+
+def _frac_text(r):
+    n, d = _integerize(r)
+    nt = _s_poly_text(n)
+    if d.is_const() and d.cval() == 1:
+        return nt
+    dt = _s_poly_text(d)
+    neg = False
+    if len(n.t) == 1:
+        if nt.startswith('-'):
+            neg, nt = True, nt[1:]
+    else:
+        nt = '(' + nt + ')'
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*(?:\^\d+)?|\d+', dt):
+        dt = '(' + dt + ')'
+    return ('-' if neg else '') + nt + '/' + dt
+
+
+def _sum_text(r):
+    """Expanded form; a monomial denominator is spread over the terms."""
+    if r.d.is_const():
+        return _s_poly_text(r.n)
+    if len(r.d.t) == 1:
+        (dm, dc), = r.d.t.items()
+        return _terms_text([(c / dc, m, dm) for m, c in r.n.t.items()])
+    return _frac_text(r)
+
+
+def _factor_group_text(items):
+    """[(poly, k)] -> a list of (text, kind) factors and the sign picked up on the way."""
+    sign = 1
+    mono, groups = [], []
+    for p, k in items:
+        if len(p.t) == 1 and () not in p.t and next(iter(p.t.values())) == 1:
+            mono.append((p, k))
+        else:
+            groups.append((p, k))
+    num = ()
+    for p, k in mono:
+        (m, _c), = p.t.items()
+        num = _mono_mul(num, tuple((a, e * k) for a, e in m))
+    out = _mono_factors(num)[0] if num else []
+    texts = []
+    for p, k in groups:
+        recs = sorted(p.t.items(), key=lambda mc: _term_key(mc[0], ()))
+        if recs[0][1] < 0:
+            p = -p
+            if k % 2: sign = -sign
+        texts.append((_s_poly_text(p), k))
+    texts.sort(key=lambda t: (len(t[0]), t[0]))
+    for t, k in texts:
+        out.append((f"({t})" if k == 1 else f"({t})^{k}", 'group' if k == 1 else 'gpow'))
+    return out, sign
+
+
+def _fact_text(c, num_items, den_items):
+    nf, s1 = _factor_group_text(num_items)
+    df, s2 = _factor_group_text(den_items)
+    c = c * s1 * s2
+    if not df and len(nf) == 1 and nf[0][1] == 'group' and c == 1:
+        return nf[0][0][1:-1]
+    neg, body = _term_text(c, nf, df)
+    return ('-' if neg else '') + body
+
+
+def _fact_parts(r):
+    c1, ni = _sp_factor(r.n)
+    c2, di = _sp_factor(r.d)
+    return c1, [(_red(p), k) for p, k in ni], c2, [(_red(p), k) for p, k in di]
+
+
+def _fact_trivial(r):
+    """True when factoring changes nothing: one factor, no multiplicity, no number in front."""
+    c1, ni, c2, di = _fact_parts(r)
+    return abs(c1 / c2) == 1 and len(ni) + len(di) <= 1 and all(k == 1 for _, k in ni + di)
+
+
+def _s_text(r, style='sum'):
+    c = r.cval()
+    if c is not None:
+        return _p_num(c)
+    if style == 'frac':
+        return _frac_text(r)
+    if style == 'fact':
+        c1, ni, c2, di = _fact_parts(r)
+        return _fact_text(c1 / c2, ni, di)
+    return _sum_text(r)
+
+# ---- the operations ----
+
+class _SymLambda(Lambda):
+    """The answer of a symbolic calculation: shown as plain text, usable like any quoted expression."""
+    def __repr__(self):
+        return _unmangle(self.expr)
+
+    def __str__(self):
+        return self.__repr__()
+
+
+def _s_simplify_text(r):
+    """The shortest of the factored, expanded and single-fraction forms (after the Pythagorean identities)."""
+    c = r.cval()
+    if c is not None:
+        return _p_num(c)
+    r = _pyth(r)
+    if r.d.is_const():
+        # a polynomial: multiply it out, unless that gets unreasonably long
+        try:
+            t = _s_text(r, 'sum')
+            if _tok_count(t) <= 60:
+                return t
+        except _SymError:
+            pass
+    best = None
+    for rank, style in enumerate(('fact', 'sum', 'frac')):
+        try:
+            if style == 'fact' and _fact_trivial(r):
+                continue
+            t = _s_text(r, style)
+        except _SymError:
+            continue
+        score = (_tok_count(t) - (2 if style == 'fact' else 0), rank)
+        if best is None or score < best[0]:
+            best = (score, t)
+    return best[1]
+
+
+def _s_divide_x(n, d, x):
+    """Divide n by d, both polynomials in the atom x (d has number coefficients): (quotient, remainder)."""
+    N = _split_var(n, x)
+    D = _split_var(d, x)
+    dd = max(D)
+    lead = D[dd].cval()
+    q = _SP()
+    while N and max(N) >= dd:
+        dn = max(N)
+        coef = N[dn].scale(1 / lead)
+        shift = dn - dd
+        xm = _SP({((x, shift),): Fraction(1)}) if shift else _SP.const(1)
+        q = q + coef * xm
+        sub = coef * xm * d
+        N = _split_var(_join_var(N, x) - sub, x)
+    return q, _join_var(N, x)
+
+
+def _s_solve(rows, rhs):
+    """Solve the square linear system rows * u = rhs (Fractions); rhs is a list of columns."""
+    n = len(rows)
+    m = [list(rows[i]) + [col[i] for col in rhs] for i in range(n)]
+    for c in range(n):
+        piv = next((r for r in range(c, n) if m[r][c] != 0), None)
+        if piv is None:
+            raise _SymError("The partial fractions could not be found.")
+        m[c], m[piv] = m[piv], m[c]
+        pv = m[c][c]
+        m[c] = [v / pv for v in m[c]]
+        for r in range(n):
+            if r != c and m[r][c] != 0:
+                f = m[r][c]
+                m[r] = [a - f * b for a, b in zip(m[r], m[c])]
+    return [[m[i][n + j] for i in range(n)] for j in range(len(rhs))]
+
+
+def _s_apart_text(r, xkey):
+    if r.d.is_const():
+        return _sum_text(r)
+    others = r.d.atoms() - {xkey}
+    if others:
+        raise CalcError("apart: the denominator may only contain the variable " + _atom_label(xkey) + ".")
+    q, rem = _s_divide_x(r.n, r.d, xkey)
+    c, items = _sp_factor(r.d)
+    items = [(p, k) for p, k in items]
+    dint = _SP.const(1)
+    for p, k in items:
+        dint = dint * (p ** k)
+    degd = sum(_sp_degree_in(p, xkey) * k for p, k in items)
+    # unknowns: for every factor power g^j the numerator coefficients (degree < deg g)
+    cols, labels = [], []
+    for i, (p, k) in enumerate(items):
+        dg = _sp_degree_in(p, xkey)
+        for j in range(1, k + 1):
+            cof = _sp_exquo(dint, p ** j)
+            for mm in range(dg):
+                poly = cof * (_SP.atom(xkey, mm) if mm else _SP.const(1))
+                cols.append([_split_var(poly, xkey).get(t, _SP()).cval() for t in range(degd)])
+                labels.append((i, j, mm))
+    rows = [[cols[u][t] for u in range(len(cols))] for t in range(degd)]
+    # right-hand sides: one column per monomial of the other atoms in the remainder
+    remx = _split_var(rem, xkey)
+    mons = set()
+    for cp in remx.values():
+        mons.update(cp.t)
+    mons = sorted(mons)
+    rhs = []
+    for mu in mons:
+        rhs.append([remx.get(t, _SP()).t.get(mu, Fraction(0)) / c for t in range(degd)])
+    sols = _s_solve(rows, rhs) if rhs else []
+    parts = []
+    qtext = _s_poly_text(q) if q.t else ''
+    if qtext:
+        parts.append((qtext.startswith('-'), qtext.lstrip('-')))
+    num = {}
+    for sol_idx, mu in enumerate(mons):
+        for u, (i, j, mm) in enumerate(labels):
+            v = sols[sol_idx][u]
+            if v:
+                key = (i, j)
+                poly = num.setdefault(key, _SP())
+                num[key] = poly + _SP({_mono_mul(mu, ((xkey, mm),) if mm else ()): v})
+    for (i, j), poly in sorted(num.items()):
+        if not poly.t:
+            continue
+        g, k = items[i]
+        parts.append(_apart_term(poly, g, j))
+    if not parts:
+        return '0'
+    out = ''
+    for idx, (neg, body) in enumerate(parts):
+        out += (('-' if neg else '') if idx == 0 else (' - ' if neg else ' + ')) + body
+    return out
+
+
+def _apart_term(poly, g, j):
+    """A partial fraction poly/g^j: (negative, text)."""
+    L = 1
+    for v in poly.t.values():
+        L = L * v.denominator // math.gcd(L, v.denominator)
+    ip = poly.scale(L)
+    gcnt = 0
+    for v in ip.t.values():
+        gcnt = math.gcd(gcnt, int(v))
+    ip = ip.scale(Fraction(1, gcnt or 1))
+    scale = Fraction(gcnt or 1, L)
+    recs = sorted(ip.t.items(), key=lambda mc: _term_key(mc[0], ()))
+    neg = recs[0][1] < 0
+    if neg:
+        ip = -ip
+    den = [(f"({_s_poly_text(g)})" if j == 1 else f"({_s_poly_text(g)})^{j}", 'group' if j == 1 else 'gpow')]
+    if scale.denominator != 1:
+        den.insert(0, (str(scale.denominator), 'num'))
+    dtxt = _join(den)
+    if len(den) > 1:
+        dtxt = '(' + dtxt + ')'
+    if ip.is_const():
+        top = str(int(ip.cval()) * scale.numerator)
+    else:
+        body = _s_poly_text(ip.scale(scale.numerator))
+        top = body if len(ip.t) == 1 else '(' + body + ')'
+    return neg, top + '/' + dtxt
+
+
+def _atom_label(key):
+    at = _ATOMS[key]
+    return _unmangle(at.a) if at.kind in ('sym', 'unit') else at.key
+
+
+def _s_collect_text(r, xkey):
+    n = r.n
+    cd = _split_var(n, xkey)
+    parts = []
+    for k in sorted(cd, reverse=True):
+        cp = cd[k]
+        xm = ((xkey, k),) if k else ()
+        if len(cp.t) == 1:
+            (m, c), = cp.t.items()
+            parts.append((c, _mono_mul(m, xm), ()))
+        else:
+            recs = sorted(cp.t.items(), key=lambda mc: _term_key(mc[0], ()))
+            sign = 1
+            if recs[0][1] < 0:
+                cp, sign = -cp, -1
+            xf = _mono_factors(xm)[0] if xm else []
+            body = '(' + _s_poly_text(cp) + ')'
+            txt = _join([(body, 'group')] + xf) if xf else body
+            parts.append((sign, txt, None))
+    out = ''
+    first = True
+    # terms of one coefficient are printed as they are; grouped ones as (...)*x^k
+    for p in parts:
+        if p[2] is None:
+            neg, txt = p[0] < 0, p[1]
+        else:
+            nf, df = _mono_factors(p[1], p[2])
+            neg, txt = _term_text(p[0], nf, df)
+        out += (('-' if neg else '') if first else (' - ' if neg else ' + ')) + txt
+        first = False
+    out = out or '0'
+    if not r.d.is_const() or r.d.cval() != 1:
+        den = _s_poly_text(r.d)
+        out = ('(' + out + ')' if len(parts) > 1 else out) + '/' + (den if re.fullmatch(r'[A-Za-z_]\w*|\d+', den) else '(' + den + ')')
+    return out
+
+
+def _s_pick_var(r, name):
+    """The atom to treat as the variable: the named one, or the only variable there is."""
+    if name:
+        key = 's:' + name
+        if key not in _ATOMS:
+            raise CalcError(f"'{_unmangle(name)}' does not appear in the expression.")
+        return key
+    vs = sorted((k for k in r.atoms() if _ATOMS[k].kind == 'sym' and _ATOMS[k].var), key=lambda k: _atom_sortname(_ATOMS[k]))
+    dv = sorted((k for k in r.d.atoms() if _ATOMS[k].kind == 'sym' and _ATOMS[k].var), key=lambda k: _atom_sortname(_ATOMS[k]))
+    pool = dv if dv else vs
+    if len(pool) == 1:
+        return pool[0]
+    if not pool:
+        raise CalcError("There is no variable in the expression.")
+    raise CalcError("There are several variables: name one, for example  sym apart x: expression")
+
+
+def _s_apply(op, r, var=None):
+    if op == 'simplify': return _s_simplify_text(r)
+    if op == 'expand':   return _s_text(r, 'sum')
+    if op == 'factor':   return _s_text(r, 'fact')
+    if op == 'cancel':   return _s_text(r, 'frac')
+    if op == 'apart':
+        if r.cval() is not None: return _p_num(r.cval())
+        return _s_apart_text(r, _s_pick_var(r, var))
+    if op == 'collect':
+        if r.cval() is not None: return _p_num(r.cval())
+        if not var:
+            raise CalcError("collect needs a variable, for example  sym collect x: expression")
+        return _s_collect_text(r, _s_pick_var(r, var))
+    raise CalcError(f"Unknown operation '{op}'.")
+
+
+# ---- the sym command and the mode ----
+
+_SYM_OPS = {'frac': 'cancel', 'simplify': 'simplify', 'simp': 'simplify', 'expand': 'expand', 'factor': 'factor',
+            'cancel': 'cancel', 'together': 'cancel', 'apart': 'apart', 'collect': 'collect'}
+
+
+def _sym_base_env(inline_str, raw, info):
+    env = dict(_stored())
+    if inline_str:
+        for tgt, val in sorta(inline_str, getv(raw)):
+            if not _is_assign_target(tgt):
+                raise _SymError("An assignment that cannot be used.")
+            env[tgt] = _s_expr(val, env, info)
+    return env
+
+
+_BARE_NAME_RE = re.compile(r'^(?:[A-Za-z]|XLONGx\d+x)$')
+
+
+def _sym_try(raw, inline_str, exp):
+    """In sym mode, an expression with unset variables is answered symbolically. True when it was."""
+    if not _SYM_MODE[0]:
+        return False
+    info = {}
+    try:
+        env = _sym_base_env(inline_str, raw, info)
+        r = _s_expr(exp, env, info)
+        if not info.get('free') and not (info.get('lam') and not _BARE_NAME_RE.match(exp.strip())):
+            return False
+        text = _s_simplify_text(r)
+    except _SymError:
+        return False
+    except CalcError as ex:
+        print(_fmt_error(str(ex)))
+        return True
+    except (SyntaxError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        return False
+    _show_symbolic(text)
+    return True
+
+
+def _show_symbolic(text):
+    _last_fmt_parts.clear()
+    _print_result(_SymLambda(text), set())
+
+
+def _sym_assign_value(val, work):
+    """The value of an assignment in sym mode when it holds unset variables: a quoted expression."""
+    info = {}
+    try:
+        r = _s_expr(val, work, info)
+        if not info.get('free') and not (info.get('lam') and not _BARE_NAME_RE.match(val.strip())):
+            return None
+        c = r.cval()
+        if c is not None:
+            return dec(c.numerator) / dec(c.denominator)
+        return Lambda(_s_simplify_text(r))
+    except (CalcError, SyntaxError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        return None
+
+
+_VAR_PREFIX_RE = re.compile(r'^\s*([A-Za-z]|_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*_)\s*:(?!:)\s*(.+)$')
+
+
+def _sym_status():
+    state = f"{GREEN}on{RST}" if _SYM_MODE[0] else f"{YELLOW}off{RST}"
+    print(f"sym is {state}  (on: unset variables stay in the answer; off: you are asked for them)")
+    print(f"  {GREEN}sym on{RST} / {GREEN}sym off{RST}      switch the mode")
+    print(f"  {GREEN}sym <expression>{RST}     simplify one expression now, whatever the mode")
+    print(f"  {GREEN}sym expand|factor|cancel|apart|collect <expression>{RST}")
+    print(f"  {GREEN}sym apart x: <expression>{RST}   name the variable (also for collect)")
+
+
+def _cmd_sym(rest):
+    rest = rest.strip()
+    low = rest.lower()
+    if not rest or low in ('?', 'help'):
+        _sym_status()
+        return
+    if low in ('on', 'off'):
+        _SYM_MODE[0] = (low == 'on')
+        print(f"{GREEN}sym {low}{RST}" + ("  (unset variables stay in the answer)" if low == 'on' else "  (unset variables are asked for)"))
+        return
+    first, _, tail = rest.partition(' ')
+    op = _SYM_OPS.get(first.lower())
+    if op:
+        tail = tail.strip()
+        if not tail:
+            raise CalcError(f"sym {first.lower()}: an expression is needed.")
+    else:
+        op, tail = 'simplify', rest
+    var = None
+    m = _VAR_PREFIX_RE.match(tail)
+    if m and op in ('apart', 'collect'):
+        var, tail = _strip_spaces(m.group(1)), m.group(2)
+    text = _strip_spaces(tail)
+    if 'func' in text:
+        text = _expand_func(text, True)
+    inline_str, exp = split_inline(text)
+    if not exp and inline_str:
+        # an assignment after sym:  sym f=func((a+b)^2),  sym f=(a+b)^2,  sym cancel x=0.34
+        if op == 'simplify':
+            old = _SYM_MODE[0]
+            _SYM_MODE[0] = True
+            try:
+                evaluate(text)
+            finally:
+                _SYM_MODE[0] = old
+            return
+        for seg in [g for g in _split_top_level(inline_str, ';') if g.strip()]:
+            parsed = _parse_assignment(seg)
+            if not parsed or not _is_assign_target(parsed[0]):
+                raise CalcError("sym: an assignment that cannot be used.")
+            tgt, val = parsed
+            info = {}
+            try:
+                r = _s_expr(val, _stored(), info)
+                out = _s_apply(op, r, var)
+            except _SymError as ex:
+                raise CalcError(f"sym: {ex}")
+            except (SyntaxError, ValueError, TypeError, RecursionError):
+                raise CalcError("sym: this expression cannot be handled symbolically.")
+            evaluate(f'{tgt}="{out}"')
+        return
+    if not exp:
+        raise CalcError("sym: nothing to calculate.")
+    info = {}
+    try:
+        env = _sym_base_env(inline_str, text, info)
+        r = _s_expr(exp, env, info)
+        out = _s_apply(op, r, var)
+    except _SymError as ex:
+        raise CalcError(f"sym: {ex}")
+    except (SyntaxError, ValueError, TypeError, RecursionError):
+        raise CalcError("sym: this expression cannot be handled symbolically.")
+    _show_symbolic(out)
+
+
+def _sym_fn(op):
+    def fn(f, v=None):
+        if isinstance(f, (dec, mpmath.mpf)):
+            return f
+        if not isinstance(f, Lambda):
+            raise CalcError(f"{op}() expects a quoted expression, for example {op}(\"(x+1)^2\").")
+        var = None
+        if v is not None:
+            if isinstance(v, Lambda) and re.fullmatch(r'[A-Za-z]|XLONGx\d+x', v.expr.strip()):
+                var = v.expr.strip()
+            else:
+                raise CalcError(f"{op}(): the variable is given as a quoted name, for example {op}(f, \"x\").")
+        try:
+            r = _s_body(f, _stored(), {})
+            return Lambda(_s_apply(op, r, var))
+        except _SymError as ex:
+            raise CalcError(f"{op}(): {ex}")
+    fn.__name__ = op
+    return fn
+
+
+for _name in ('simplify', 'expand', 'factor', 'cancel', 'apart', 'collect'):
+    dco[_name] = _sym_fn(_name)
+
+
+# ---- func(...): the expression as a quoted expression ----
+
+_FUNC_RE = re.compile(r'(?<![A-Za-z0-9_])func\s*\(')
+
+
+def _func_close(s, i):
+    """Index of the parenthesis closing the one at s[i], skipping quoted text."""
+    depth, q = 0, ''
+    for j in range(i, len(s)):
+        ch = s[j]
+        if q:
+            if ch == q: q = ''
+        elif ch in '"\'':
+            q = ch
+        elif ch in '([{':
+            depth += 1
+        elif ch in ')]}':
+            depth -= 1
+            if depth == 0:
+                return j
+    raise CalcError("func(): a closing parenthesis is missing.")
+
+
+def _expand_func(text, simplify):
+    """Replace every func(a, b, ..) in text by the quoted sum of its arguments (simplified when asked)."""
+    out, pos = [], 0
+    while True:
+        m = _FUNC_RE.search(text, pos)
+        if not m:
+            break
+        # not inside quoted text
+        if (text.count('"', 0, m.start()) % 2) or (text.count("'", 0, m.start()) % 2):
+            out.append(text[pos:m.end()])
+            pos = m.end()
+            continue
+        op = m.end() - 1
+        cl = _func_close(text, op)
+        args = [a.strip() for a in _split_top_level(text[op + 1:cl], ',')]
+        if not any(args):
+            raise CalcError("func(): an expression is needed, for example func((a+b)^2)")
+        if not all(args):
+            raise CalcError("func(): an argument is empty.")
+        args = [_expand_func(a, simplify) for a in args]
+        if any('"' in a or "'" in a for a in args):
+            raise CalcError("func(): give plain expressions, not quoted text.")
+        body = None
+        if simplify:
+            info = {}
+            try:
+                env = _stored()
+                tot = None
+                for a in args:
+                    ra = _s_expr(a, env, info)
+                    tot = ra if tot is None else tot + ra
+                body = _s_simplify_text(tot)
+            except (_SymError, SyntaxError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
+                body = None
+            except CalcError:
+                raise
+        if body is None:
+            body = args[0] if len(args) == 1 else '+'.join('(' + a + ')' for a in args)
+        out.append(text[pos:m.start()] + '"' + body + '"')
+        pos = cl + 1
+    out.append(text[pos:])
+    return ''.join(out)
+
+
+def _func_builtin(*args):
+    """func() reached with evaluated arguments: their sum, as a quoted expression."""
+    parts = []
+    for a in args:
+        if isinstance(a, Lambda):
+            parts.append(a.expr)
+        elif isinstance(a, (dec, mpmath.mpf)):
+            parts.append(_fmt_result(a))
+        else:
+            raise CalcError("func() expects expressions.")
+    return Lambda(parts[0] if len(parts) == 1 else '+'.join('(' + p + ')' for p in parts))
+
+
+dco['func'] = _func_builtin
+
+
+def _frac_fn(v):
+    """frac(0.34) is "17/50": a number as a fraction (a quoted expression); frac of a quoted expression is cancel."""
+    if isinstance(v, Lambda):
+        return dco['cancel'](v)
+    if isinstance(v, mpmath.mpf):
+        v = dec(mpmath.nstr(v, ctx.prec, strip_zeros=False))
+    if not isinstance(v, dec):
+        raise CalcError("frac() expects a number, for example frac(0.34).")
+    if not v.is_finite():
+        raise CalcError("frac(): not a finite number.")
+    f = _dec_frac(v)
+    if len(v.as_tuple().digits) >= 25 and f.denominator > 10 ** 12:
+        raise CalcError("frac(): this number is not a simple fraction.")
+    return Lambda(_p_num(f))
+
+
+dco['frac'] = _frac_fn
 
 
 # COMMAND
@@ -3315,7 +5842,7 @@ def _const_one(item: str) -> None:
     if key is None:
         print(_fmt_error("Constant names are one letter or _long_name_.")); return
     if _unit_active_key(key):
-        print(_fmt_error(f"'{_disp_name(key)}' is an imaginary unit \u2014 switch it off first: img {_disp_name(key)}")); return
+        print(_fmt_error(f"'{_disp_name(key)}' is an imaginary unit, switch it off first: img {_disp_name(key)}")); return
     if not val:
         if op: print(_fmt_error(f"'{op}=' needs a value.")); return
         if key in _const_vars: print(_fmt_result(_const_vars[key]))
@@ -3385,7 +5912,7 @@ def _var_one(item: str) -> None:
     if key is None:
         print(_fmt_error("Variable names are one letter or _long_name_.")); return
     if _unit_active_key(key):
-        print(_fmt_error(f"'{_disp_name(key)}' is an imaginary unit \u2014 switch it off first: img {_disp_name(key)}")); return
+        print(_fmt_error(f"'{_disp_name(key)}' is an imaginary unit, switch it off first: img {_disp_name(key)}")); return
     if key in _const_vars:
         print(_fmt_error(f"'{_disp_name(key)}' is a constant \u2014 change it with: const {_disp_name(key)} <value>")); return
     if not val:
@@ -3530,6 +6057,7 @@ _COMMANDS = {
     'constin':     lambda r: _cmd_constin(r),
     'constrmall':  lambda r: _cmd_constrmall(),
     'rounding':    lambda r: _cmd_rounding(r),
+    'sym':         lambda r: _cmd_sym(r),
     'img':         lambda r: _cmd_img(r),
     'imgrm':       lambda r: _cmd_imgrm(r),
     'imgrmall':    lambda r: _cmd_imgrmall(),
@@ -3613,7 +6141,7 @@ def hlp():
     ]))
     print(f"""
 {BOLD}Quick reference:{RST}
-  Commands:   help / new / back / prec <n> / rounding <mode> / img... / var... / const... / save... / load   (quit: Ctrl+D, on Windows Ctrl+Z then Enter)
+  Commands:   help / new / back / prec <n> / rounding <mode> / sym... / img... / var... / const... / save... / load   (quit: Ctrl+D, on Windows Ctrl+Z then Enter)
   Operators:  + - * / ** // %     (^ is the same as **)
   Variables:  single letters, or a word in underscores like _speed_
   Subscript:  x[1] / _work_[0] / {{0,1}}[0]
@@ -3692,7 +6220,7 @@ def hlp():
   {GREEN}until(step, .., cond){RST} same steps, stops once cond is true (checked after each tick).
                    Example:  x={{0,1}}; until(x+=, x[10]==10)     (aliases: rep, unt)
 
-{BOLD}Variables{RST} (assigned functions and sets are kept; numbers only through var):
+{BOLD}Variables{RST} (a line with only assignments, like o=5 or f="x+1", stores any value; inside an expression, x=5;x+1 is temporary):
   {GREEN}var x 5{RST}  {GREEN}var x=5{RST}  {GREEN}var x+=1{RST}   store or change a variable
   {GREEN}var a=1 b=2{RST}   several at once; a value may contain spaces
   {GREEN}var x{RST} show   {GREEN}var{RST} list   {GREEN}varrm x y{RST} remove   {GREEN}varrmall{RST} remove all
@@ -3701,6 +6229,16 @@ def hlp():
   {GREEN}const x 5{RST}  {GREEN}const x=5{RST}  {GREEN}const x+=1{RST}   define (asks before replacing) or update
   {GREEN}const a=1 b=2{RST}   several at once
   {GREEN}const x{RST} show   {GREEN}const{RST} list   {GREEN}constrm x y{RST} remove   {GREEN}constex x{RST} exists   {GREEN}constin x{RST} info   {GREEN}constrmall{RST} remove all
+
+{BOLD}Symbolic algebra{RST} (exact; unset variables stay in the answer):
+  {GREEN}sym on{RST} / {GREEN}sym off{RST}   with sym on, x*2+x is answered 3x instead of asking for x
+  {GREEN}sym <expression>{RST}    simplify one expression now:  sym (x^2-1)/(x-1)  ->  x + 1
+  {GREEN}sym expand|factor|cancel|apart|collect <expression>{RST}   {GREEN}sym apart x: <expression>{RST} names the variable
+  The same as functions of quoted expressions: simplify("..."), expand(f), factor(f), cancel(f), apart(f), collect(f,"x")
+  {GREEN}sym cancel x=0.34{RST}   an operation before an assignment stores the result: x = "17/50"
+  {GREEN}frac(0.34){RST}   a number as a fraction, quoted: "17/50"
+  {GREEN}func(a, b, ..){RST}   the expression(s), added, as a quoted expression, simplified with sym on:  f=func((a+b)^2)  ->  f = "a^2 + 2a*b + b^2"
+  Unset variables are taken as real numbers; exact fractions and roots are kept (sym 0.5+sqrt(8) -> 1/2 + 2*sqrt(2)).
 
 {BOLD}Imaginary units:{RST}
   {GREEN}img{RST}        list (the first one that is on is the main unit, used by sqrt(-4))
@@ -4193,6 +6731,11 @@ def _group_tokens(tokens: list, lo: int, hi: int, v_dict: dict, in_subscript: bo
                 inner = _group_tokens(tokens, i + 1, j - 1, v_dict,
                                        in_subscript=(open_ch == '['),
                                        in_str_call=child_in_str)
+            if open_ch == '(' and depth == 0 and not inner.strip() and atoms and atoms[-1][2].string in (')', ']'):
+                # ('10')()  frac(0.5)(): call what the brackets gave, not a product with ()
+                atoms.append(('()', Tok(t.type, '()'), tokens[j - 1]))
+                i = j
+                continue
             if open_ch == '(' and depth == 0 and not inner.strip() and not (atoms and atoms[-1][2].type in (tokenize.NAME, _TOK_STRING)):
                 raise CalcError("Empty parentheses.")
             atoms.append((open_ch + inner + close_ch, t, tokens[j - 1]))
@@ -4942,7 +7485,30 @@ def evaluate(raw: str) -> None:
     except CalcError as ex:
         print(_fmt_error(str(ex)))
         return
+    if 'func' in raw:
+        try:
+            raw = _expand_func(raw, _SYM_MODE[0])
+        except CalcError as ex:
+            print(_fmt_error(str(ex)))
+            return
     inline_str, exp = split_inline(raw)
+
+    targets = set(_assign_targets(inline_str))
+    lead = re.match(r'^([A-Za-z][A-Za-z0-9]*)(?:\*\*|//|[+\-*/|])?=(?!=)', raw)
+    if lead and lead.group(1) in dco:
+        targets.add(lead.group(1))
+    for t in sorted(targets):
+        base = t.split('[', 1)[0]
+        if _unit_active_key(base):
+            print(_fmt_error(f"'{_disp_name(base)}' is an imaginary unit, switch it off first: img {_disp_name(base)}"))
+            return
+        if base in dco:
+            kind = 'function' if callable(dco[base]) else 'constant'
+            print(_fmt_error(f"'{base}' is an internal {kind} and cannot be assigned."))
+            return
+
+    if exp and _SYM_MODE[0] and _sym_try(raw, inline_str, exp):
+        return
 
     if not exp:
         if inline_str:
@@ -4950,24 +7516,37 @@ def evaluate(raw: str) -> None:
             tmp      = _stored()
             shown    = False
             for tgt, val in sorta(inline_str, all_vars):
-                ev = cal(val, tmp, nodisplay=True)
+                ev = _sym_assign_value(val, tmp) if _SYM_MODE[0] else None
+                if ev is None:
+                    ev = cal(val, tmp, nodisplay=True, allow_inf=True)
+                if isinstance(ev, _MissingArgs) or isinstance(ev, _SFStrResult):
+                    print(_fmt_error("Invalid operation from input."))
+                    shown = True
+                    break
                 if isinstance(ev, str):
                     print(ev)
                     shown = True
                     break
                 m = _SET_INDEX_TGT_RE.match(tgt)
                 base = m.group(1) if m and isinstance(tmp.get(m.group(1)), SetObj) else None
-                if not (isinstance(ev, (Lambda, SetObj)) or base):
-                    tmp[tgt] = ev
-                    continue
                 target = base or tgt
+                name = _disp_name(target) if not _is_subscript_target(target) else _unmangle(target)
                 if target in _const_vars:
-                    name = _disp_name(target)
                     print(_fmt_error(f"'{name}' is a constant \u2014 change it with: const {name} <value>"))
                     shown = True
                     continue
-                _store_assignment(tmp, tgt, ev)
-                print(f"{_disp_name(target)} = {tmp[target]}")
+                if _unit_active_key(target):
+                    print(_fmt_error(f"'{name}' is an imaginary unit, switch it off first: img {name}"))
+                    shown = True
+                    continue
+                verb = "updated" if target in _user_vars else "added"
+                if base:
+                    _store_assignment(tmp, tgt, ev)
+                else:
+                    tmp[tgt] = ev
+                    _user_vars[tgt] = ev
+                _user_vars[target] = tmp[target]
+                print(f"{GREEN}+ {name}{RST} = {_fmt_result(tmp[target])}  {GRAY}(variable {verb}){RST}")
                 shown = True
             if not shown:
                 print(_fmt_error("No expression found after assignments."))
@@ -5033,7 +7612,7 @@ _CLI_OPTIONS = {
     '--pipe': ('pipe', False), '--no-prompt': ('no_prompt', False),
     '--no-loop': ('no_loop', False), '--no-ask': ('no_ask', False),
     '--no-color': ('no_color', False), '--no-colors': ('no_color', False), '--color': ('color', False),
-    '--no-default': ('no_default', False),
+    '--no-default': ('no_default', False), '--sym': ('sym', False),
     '--prec': ('prec', True), '--set': ('set', True), '--const': ('const', True),
     '--load': ('load', True), '--saves': ('saves', True),
 }
@@ -5058,6 +7637,7 @@ Only the options below are options, so -7//2 is an expression. -- ends the optio
   --const A=1    store a constant first
   --load NAME    load save NAME instead of the default one
   --no-default   do not load the default save
+  --sym          start in sym mode: unset variables stay in the answer
   --saves FILE   save file (default ./dcalc_saves.json, or $DCALC_SAVES)
   --version      print the version
   --help         print this help
@@ -5067,7 +7647,7 @@ exit status: 0 success, 1 a failed expression (--pipe, --no-prompt), 2 invalid u
 
 def _parse_args(argv) -> dict:
     opts = {'help': False, 'version': False, 'pipe': False, 'no_prompt': False, 'no_loop': False, 'no_ask': False,
-            'color': None, 'no_default': False, 'prec': None, 'set': [], 'const': [], 'load': None,
+            'color': None, 'no_default': False, 'sym': False, 'prec': None, 'set': [], 'const': [], 'load': None,
             'saves': None, 'exprs': []}
     i, only_exprs = 0, False
     while i < len(argv):
@@ -5210,6 +7790,8 @@ def _main(argv=None) -> None:
         if text and not scripted: print(f"{GRAY}{text}{RST}")
     elif not opts['no_default']:
         _autoload_default(announce=not scripted)
+    if opts['sym']:
+        _SYM_MODE[0] = True
     if opts['prec'] is not None:
         _cli_setup(lambda: actions(f"prec {opts['prec']}"), f"--prec {opts['prec']}")
     for item in opts['set']:
