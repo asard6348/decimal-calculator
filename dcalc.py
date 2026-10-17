@@ -82,6 +82,13 @@ def _plain(text):
     return _ANSI_RE.sub('', text) if _NO_COLOR and isinstance(text, str) else text
 
 
+def _rl_prompt(prompt):
+    prompt = _plain(prompt)
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return prompt
+    return _ANSI_RE.sub(lambda m: '\001' + m.group(0) + '\002', prompt)
+
+
 def print(*args, **kwargs):
     if args and isinstance(args[0], str) and args[0].startswith(RED):      # an error message
         _ERROR_COUNT[0] += 1
@@ -93,7 +100,7 @@ def print(*args, **kwargs):
 def input(prompt=''):
     if NO_ASK:
         raise _AskDenied(prompt)
-    return builtins.input(_plain(prompt))
+    return builtins.input(_rl_prompt(prompt))
 
 
 _PY_JARGON = [
@@ -8196,7 +8203,7 @@ def _main(argv=None) -> None:
                 if _pending_expr[0] is not None:
                     raw = _pending_expr[0]; _pending_expr[0] = None
                 else:
-                    raw = builtins.input(_plain(f"{BRBL}{BOLD}>>{RST} ")).strip()
+                    raw = builtins.input(_rl_prompt(f"{BRBL}{BOLD}>>{RST} ")).strip()
                 if not raw or raw.lower() == 'new': continue
                 _run_line(raw)
     except EOFError:
