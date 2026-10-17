@@ -122,8 +122,6 @@ Pasted text is accepted with these characters: `−` `×` `÷` `π` `²` `³`.
 2×3                               → 6
 ```
 
-There is no `5!`, `fact(5)` is used instead.
-
 ## Variables
 
 A variable is a single letter, or a word between underscores like `_speed_`.
@@ -202,6 +200,7 @@ log(100,10)                       → 2
 log2(1024)                        → 10
 exp(1)                            → 2.71828182845904523536028747135
 fact(5)                           → 120
+5!                                → 120
 factorial(20)                     → 2432902008176640000
 hypot(3,4)                        → 5
 clamp(15,0,10)                    → 10
@@ -505,8 +504,8 @@ len({1,2,3})                      → 3
 ```
 
 `==`, `!=`, `<`, `>`, `<=`, `>=` work on numbers, sets, strings and functions.
-`~=` rounds both sides to whole numbers first (by the [rounding mode](#rounding)). `!` is not: true for 0, an empty set
-and an empty string.
+`~=` rounds both sides to whole numbers first (by the [rounding mode](#rounding)). `!` before a value is not: true for 0, an empty set
+and an empty string. `!` after a value is factorial: `5!` is 120, `3!!` is `(3!)!`, and `3!!0` is `3!` times `!0`.
 
 `(A):IF(c):(B)` gives `A` if the condition is true, otherwise `B`. Several conditions
 can be separated by commas, all of them must be true.

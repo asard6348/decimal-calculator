@@ -4795,7 +4795,7 @@ def _sin_cos_at(k):
 _ODD  = {'sin', 'tan', 'cot', 'csc', 'asin', 'atan', 'sinh', 'tanh', 'coth', 'csch', 'asinh', 'atanh', 'erf', 'sign'}
 _EVEN = {'cos', 'sec', 'cosh', 'sech'}
 _OPAQUE = _ODD | _EVEN | {'acos', 'acot', 'asec', 'acsc', 'acosh', 'asech', 'acsch', 'acoth', 'gamma', 'digamma',
-                          'erfc', 'floor', 'ceil', 'zeta', 'lgamma', 'sinc', 'trunc'}
+                          'erfc', 'floor', 'ceil', 'zeta', 'lgamma', 'sinc', 'trunc', 'factorial'}
 _INV_VALUES = {
     'asin': {Fraction(0): Fraction(0), Fraction(1, 2): Fraction(1, 6), Fraction(1): Fraction(1, 2)},
     'acos': {Fraction(1): Fraction(0), Fraction(1, 2): Fraction(1, 3), Fraction(0): Fraction(1, 2)},
@@ -5140,6 +5140,9 @@ def _atom_text(at, e):
         if e == 1: return t, ('var' if eligible else 'other')
         return f"{t}^{e}", ('varpow' if eligible else 'other')
     if at.kind == 'fn':
+        if at.a == 'factorial' and len(at.b) == 1:
+            t = _paren_if_needed(_s_text(at.b[0], 'sum')) + '!'
+            return (t if e == 1 else f"({t})^{e}"), 'other'
         t = at.a + '(' + ', '.join(_s_text(a, 'sum') for a in at.b) + ')'
         return (t if e == 1 else f"{t}^{e}"), 'other'
     if at.kind == 'rt':
@@ -6360,6 +6363,7 @@ def hlp():
   {GREEN}== != < > <= >={RST}   compare numbers, strings, functions, sets (sets: < <= > >= mean subset/superset)
   {GREEN}a ~= b        {RST}  equal after rounding both sides to whole numbers
   {GREEN}!x            {RST}  not: true for 0, empty set/string, empty function
+  {GREEN}x!            {RST}  factorial: 5! is 120
   {GREEN}(A):IF(c,..):(B){RST}  A if every condition is true, otherwise B
 
 {BOLD}Assignment:{RST}
@@ -6585,6 +6589,15 @@ def get_clean_tokens(s: str) -> list:
 
     except tokenize.TokenError:
         pass
+
+    split_ne = []
+    for idx, tok in enumerate(raw_tokens):
+        if tok.string == '!=' and tok.type == tokenize.OP and idx + 1 < len(raw_tokens) and raw_tokens[idx + 1].string == '=':
+            split_ne.append(Tok(tokenize.OP, '!'))
+            raw_tokens[idx + 1] = Tok(tokenize.OP, '==')
+        else:
+            split_ne.append(tok)
+    raw_tokens = split_ne
 
     expanded = []
     for idx, tok in enumerate(raw_tokens):
@@ -6915,6 +6928,43 @@ def _not_operand_end(tokens, k, hi, sym='!'):
     return k
 
 
+def _ends_operand(tok):
+    return tok.type in (tokenize.NUMBER, tokenize.NAME) or tok.string in (')', ']', '}')
+
+
+def _bang_run(tokens, k, hi):
+    e = k
+    while e < hi and tokens[e].string == '!':
+        e += 1
+    n = e - k
+    if n and e < hi and (tokens[e].type in (tokenize.NUMBER, tokenize.NAME) or tokens[e].string in ('(', '{')):
+        n -= 1
+    return n
+
+
+def _operand_start(tokens):
+    j = len(tokens)
+    while j > 0:
+        if tokens[j - 1].string not in (')', ']', '}'):
+            return j - 1
+        depth, m = 0, j - 1
+        while m >= 0:
+            sm = tokens[m].string
+            if sm in (')', ']', '}'): depth += 1
+            elif sm in _CLOSERS:
+                depth -= 1
+                if depth == 0: break
+            m -= 1
+        if m < 0:
+            raise CalcError(f"Unclosed '{tokens[j - 1].string}'.")
+        j = m
+        if tokens[m].string == '(' and m > 0 and tokens[m - 1].type == tokenize.NAME:
+            return m - 1
+        if not (tokens[m].string == '[' and m > 0 and _ends_operand(tokens[m - 1])):
+            return j
+    return 0
+
+
 def _rewrite_prefix(tokens, lo, hi, sym, fn, v_dict, in_subscript, in_str_call):
     """Rewrite each depth-0 prefix `sym` + operand into one synthetic fn(...) atom.
     Returns the new token list, or None if there was nothing to rewrite."""
@@ -6927,12 +6977,32 @@ def _rewrite_prefix(tokens, lo, hi, sym, fn, v_dict, in_subscript, in_str_call):
             e = _not_operand_end(tokens, k + 1, hi, sym)
             op = tokens[k + 1:e]
             if not op:
-                hint = " (for a factorial use fact(n))" if sym == '!' else ''
-                raise CalcError(f"'{sym}' needs an operand after it{hint}.")
+                raise CalcError(f"'{sym}' needs an operand after it.")
             new.append(Tok(tokenize.NAME, f"{fn}({_group_tokens(op, 0, len(op), v_dict, in_subscript, in_str_call)})"))
             k, changed = e, True
         else:
             new.append(tokens[k]); k += 1
+    return new if changed else None
+
+
+def _rewrite_factorial(tokens, lo, hi, v_dict, in_subscript, in_str_call):
+    new, k, d, changed = [], lo, 0, False
+    while k < hi:
+        sk = tokens[k].string
+        if sk in _CLOSERS: d += 1
+        elif sk in (')', ']', '}'): d -= 1
+        n = _bang_run(tokens, k, hi) if sk == '!' and d == 0 and new and _ends_operand(new[-1]) else 0
+        if n:
+            for _ in range(n):
+                j = _operand_start(new)
+                op = new[j:]
+                del new[j:]
+                new.append(Tok(tokenize.NAME, f"factorial({_group_tokens(op, 0, len(op), v_dict, in_subscript, in_str_call)})"))
+            changed = True
+            k += n
+        else:
+            new.append(tokens[k])
+            k += 1
     return new if changed else None
 
 
@@ -6968,6 +7038,10 @@ def _rewrite_special_syntax(tokens: list, lo: int, hi: int, v_dict: dict, in_sub
     for k in _depth0(tokens, lo, hi):
         if tokens[k].string == ':' and lo < k < hi - 1:
             return f"_member(({sub(tokens[lo:k])}),({sub(tokens[k + 1:hi])}))"
+
+    rewritten = _rewrite_factorial(tokens, lo, hi, v_dict, in_subscript, in_str_call)
+    if rewritten is not None:
+        return sub(rewritten)
 
     rewritten = _rewrite_prefix(tokens, lo, hi, '!', '_not', v_dict, in_subscript, in_str_call)
     if rewritten is not None:
