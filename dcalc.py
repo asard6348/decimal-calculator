@@ -2443,7 +2443,33 @@ for _name in dir(mpmath):
         dco[_name] = _make_wrapper(_obj, _name)
 
 
-def _int(x):  return dec(int(x))
+def _from_base_one(v, base: int) -> dec:
+    if isinstance(v, str):
+        s = str(v).strip()
+    elif isinstance(v, dec) and v.is_finite():
+        s = format(v, 'f')
+    else:
+        raise CalcError("int(): a number or text is needed.")
+    sign = 1
+    if s[:1] in ('+', '-'):
+        sign = -1 if s[0] == '-' else 1
+        s = s[1:]
+    whole, _, frac = s.partition('.')
+    valid = _BASE_DIGITS[:base]
+    if not whole or not all(c in valid for c in (whole + frac).lower()):
+        raise CalcError(f"int(): '{_ANSI_RE.sub('', str(v))}' is not a number in base {base}.")
+    return dec(sign * int(whole.lower(), base))
+
+
+def _int(x, *more):
+    if not more:
+        return dec(int(x))
+    a = (x,) + more
+    base = _int_arg(a[-1], 'int')
+    if not 2 <= base <= 36:
+        raise CalcError("int(): the base must be a whole number from 2 to 36.")
+    out = [_from_base_one(v, base) for v in a[:-1]]
+    return out[0] if len(out) == 1 else SetObj('list', values=out)
 
 
 def _round(x, n=dec(0)):
@@ -2823,6 +2849,48 @@ def _digsum(n):
     return dec(sum(int(c) for c in str(abs(_int_arg(n, 'digsum')))))
 
 
+_BASE_DIGITS = '0123456789abcdefghijklmnopqrstuvwxyz'
+
+
+def _to_base_one(v, base: int) -> str:
+    if v.is_nan() or v.is_infinite():
+        raise CalcError("format(): a finite number is needed.")
+    neg = v < 0
+    q = Fraction(abs(v))
+    whole, frac = divmod(q.numerator, q.denominator)
+    digits = ''
+    while whole:
+        whole, r = divmod(whole, base)
+        digits = _BASE_DIGITS[r] + digits
+    digits = digits or '0'
+    if frac:
+        limit = int(DISPLAY_PREC / math.log10(base)) + 1
+        rest, out = Fraction(frac, q.denominator), ''
+        while rest and len(out) < limit:
+            rest *= base
+            d = int(rest)
+            out += _BASE_DIGITS[d]
+            rest -= d
+        if out:
+            digits += '.' + out
+    return ('-' if neg else '') + digits
+
+
+def _format_base(*a):
+    if len(a) < 2:
+        raise CalcError("format() needs at least one value and a base.")
+    base = _int_arg(a[-1], 'format')
+    if not 2 <= base <= 36:
+        raise CalcError("format(): the base must be a whole number from 2 to 36.")
+    return _Str(' '.join(_to_base_one(v, base) for v in _nums(a[:-1], 'format')))
+
+
+def _bin(*a):
+    if not a:
+        raise CalcError("bin() needs at least one value.")
+    return _Str(' '.join(_to_base_one(v, 2) for v in _nums(a, 'bin')))
+
+
 def _sort(s):
     v = _nums([s], 'sort'); return SetObj('list', values=sorted(v))
 
@@ -3076,7 +3144,8 @@ for _n, _f in {'sum': _sum, 'prod': _prod, 'mean': _mean, 'median': _median,
                'log2': _log2, 'clamp': _clamp, 'lerp': _lerp, 'mod': _op_mod, 'iff': _iff,
                'abs': _abs, 'max': _max, 'min': _min,
                'dist': _dist, 'digsum': _digsum, 'sort': _sort, 'rev': _rev,
-               'randmatrix': _randmatrix, 'randrange': _randrange}.items():
+               'randmatrix': _randmatrix, 'randrange': _randrange,
+               'format': _format_base, 'bin': _bin}.items():
     dco[_n] = _f
 
 
@@ -6408,6 +6477,12 @@ def hlp():
   {GREEN}randrange(stop){RST}  random whole number from 0 to stop-1;  {GREEN}randrange(start, stop[, step]){RST} works like Python's
   {GREEN}randmatrix(m[, n[, lo, hi]]){RST}
                    m rows of n random numbers (n = m, range [lo, hi) = [0, 1) by default) as a set of rows:  randmatrix(2) → {{{{0.12,0.83}},{{0.5,0.07}}}}
+
+{BOLD}Number bases:{RST}
+  {GREEN}int(x, base)   {RST}  read x as a number written in base 2..36, give it in decimal:  int([ff],16) → 255;  int(101,2) → 5
+  {GREEN}int(a, b, .., base){RST}  several values at once, as a set:  int([ff],[10],16) → {{255,16}}
+  {GREEN}format(a, .., base){RST}  write numbers in base 2..36 as text:  format(255,16) → ff
+  {GREEN}bin(a, ..)     {RST}  write numbers in binary:  bin(10) → 1010
 
 {BOLD}Loops (top-level calls):{RST}
   {GREEN}repeat(step, .., n){RST}   run every step n times. A step is  x=..  x+=..  x+=  or a bare

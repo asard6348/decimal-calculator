@@ -264,6 +264,35 @@ m=randmatrix(2,3);len(m[0])       → 3
 m=randmatrix(2);m[1][0]<1         → True
 ```
 
+### Number bases
+
+`bin` and `format` write numbers as text in another base. `int` with a base reads such
+text back into a decimal number. Bases from 2 to 36 are allowed, with the digits
+`0-9` and `a-z`.
+
+```
+bin(10)                           → 1010
+bin(5,6,-3)                       → 101 110 -11
+bin(0.625)                        → 0.101
+format(255,16)                    → ff
+format(255,10,36)                 → 73 a
+int([ff],16)                      → 255
+int(101,2)                        → 5
+int([ff],[10],16)                 → {255,16}
+format(int([ff],16),2)            → 11111111
+```
+
+`bin(a, ...)` writes every value in binary. `format(a, ..., base)` takes the base as its
+last argument and writes every value in it. With several values the answer is one text,
+separated by spaces. Negative numbers get a `-`, and a fraction gets digits after the
+point, about as many as the display shows.
+
+`int(x, base)` also takes the base as its last argument. `x` is a number whose digits are
+read in that base (`101` is `5` in base 2), or text between square brackets when it has
+letters (`[ff]`). With several values, `int(a, b, ..., base)` gives them as a set. Like
+`int` without a base, a fraction is cut off toward zero. A digit that does not fit the
+base (`int(102,2)`) is an error.
+
 ## Stored variables
 
 `var` keeps a variable of any kind (number, function, set) for the session. A stored
