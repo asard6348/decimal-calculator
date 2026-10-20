@@ -20,6 +20,7 @@ Code structure:
 import ast
 import builtins
 import contextlib
+import copy
 import decimal
 import difflib
 import inspect
@@ -1385,10 +1386,20 @@ def _symbolic_diff(expr_str: str, var: str, order: int = 1) -> str:
         raise CalcError(f"Symbolic diff error: {err}")
 
 
-def _diff_lambda(f, order=None):
+def _diff_lambda(f, a=None, b=None):
     if not isinstance(f, Lambda):
         raise CalcError("diff() expects a Lambda (quoted expression). "
                           "Example: diff(\"sin(x)\")")
+    var, order = None, None
+    for extra in (a, b):
+        if extra is None:
+            continue
+        if var is None and isinstance(extra, Lambda) and _VAR_NAME_RE.match(extra.expr.strip()):
+            var = extra.expr.strip()
+        elif order is None:
+            order = extra
+        else:
+            raise CalcError("diff(): too many arguments.")
     if not f.params:
         return Lambda("0", [])
     if order is None:
@@ -1397,7 +1408,14 @@ def _diff_lambda(f, order=None):
         n = int(order)
     else:
         raise CalcError("diff(): the order must be a whole number, 0 or more.")
-    var    = f.params[0]
+    if var is None:
+        var = f.params[0]
+    if _SYM_CALL_RE.search(f.expr):
+        try:
+            r = _sym_diff_r(_s_ast(f.expr, {}), var, n, {}, {})
+            return Lambda(_s_simplify_text(r))
+        except _SymError as ex:
+            raise CalcError(f"diff(): {ex}")
     d_expr = _symbolic_diff(f.expr, var, n)
     return Lambda(d_expr, f.params)
 
@@ -5106,10 +5124,77 @@ def _s_name(name, env, info):
 _SQRT_LIKE = {'sqrt': 2, 'cbrt': 3}
 
 
+_SYM_WRAPPERS = ('expand', 'factor', 'cancel', 'together', 'apart', 'collect', 'simplify', 'simp', 'frac')
+_SYM_CALL_RE  = re.compile(r'(?<![A-Za-z0-9_])(?:' + '|'.join(_SYM_WRAPPERS) + r')\s*\(')
+_VAR_NAME_RE  = re.compile(r'^(?:[A-Za-z]|XLONGx\d+x)$')
+
+
+class _StripOps(ast.NodeTransformer):
+    def __init__(self, env):
+        self.env = env
+
+    def visit_Name(self, node):
+        v = self.env.get(node.id)
+        if isinstance(v, Lambda):
+            return self.visit(_s_ast(v.expr, self.env))
+        return node
+
+    def visit_Call(self, node):
+        if isinstance(node.func, ast.Name):
+            fn = node.func.id
+            if fn == 'Lambda' and len(node.args) == 1 and isinstance(node.args[0], ast.Constant) \
+                    and isinstance(node.args[0].value, str):
+                return self.visit(_s_ast(node.args[0].value, self.env))
+            if fn in _SYM_WRAPPERS and node.args:
+                return self.visit(node.args[0])
+        self.generic_visit(node)
+        return node
+
+
+def _sym_diff_r(node, var, order, env, info):
+    env = {k: v for k, v in env.items() if k != var}
+    node = _StripOps(env).visit(node)
+    try:
+        for _ in range(order):
+            node = _simp(_diff_node(node, var))
+    except CalcError as ex:
+        raise _SymError(str(ex))
+    return _s_conv(node, env, info)
+
+
+def _s_name_arg(a):
+    if isinstance(a, ast.Name):
+        return a.id
+    if isinstance(a, ast.Call) and isinstance(a.func, ast.Name) and a.func.id == 'Lambda' and len(a.args) == 1 \
+            and isinstance(a.args[0], ast.Constant) and isinstance(a.args[0].value, str) \
+            and _VAR_NAME_RE.match(a.args[0].value.strip()):
+        return a.args[0].value.strip()
+    return None
+
+
+def _s_diff_call(args, env, info):
+    var, order = None, 1
+    for a in args[1:]:
+        nm = _s_name_arg(a)
+        if nm is not None and var is None:
+            var = nm
+            continue
+        c = _cv(a)
+        if c is None or c != c.to_integral_value() or c < 0:
+            raise _SymError("The order of diff() must be a whole number, 0 or more.")
+        order = int(c)
+    if var is None:
+        probe = _s_conv(_StripOps(env).visit(copy.deepcopy(args[0])), env, {})
+        var = _ATOMS[_s_pick_var(probe, None)].a
+    return _sym_diff_r(args[0], var, order, env, info)
+
+
 def _s_call(node, env, info):
     if not isinstance(node.func, ast.Name) or node.keywords:
         raise _SymError("A call that cannot be used.")
     fn = node.func.id
+    if fn == 'diff' and fn not in env and 1 <= len(node.args) <= 3:
+        return _s_diff_call(node.args, env, info)
     if fn == 'Lambda' and len(node.args) == 1 and isinstance(node.args[0], ast.Constant) \
             and isinstance(node.args[0].value, str):
         info['lam'] = True
@@ -5123,6 +5208,8 @@ def _s_call(node, env, info):
     if fn in env:
         raise _SymError("Not a function.")
     n = len(args)
+    if fn in _SYM_WRAPPERS and n >= 1:
+        return args[0]
     if fn in _SQRT_LIKE and n == 1:
         return _r_root(args[0], _SQRT_LIKE[fn])
     if fn == 'exp' and n == 1:
@@ -5759,6 +5846,7 @@ def _cmd_sym(rest):
         return
     first, _, tail = rest.partition(' ')
     op = _SYM_OPS.get(first.lower())
+    explicit = bool(op)
     if op:
         tail = tail.strip()
         if not tail:
@@ -5772,7 +5860,13 @@ def _cmd_sym(rest):
     text = _strip_spaces(tail)
     if 'func' in text:
         text = _expand_func(text, True)
+    text = _quote_diff_vars(text)
     inline_str, exp = split_inline(text)
+    if exp and not explicit:
+        head = _sym_head(exp)
+        if head:
+            op, exp, head_var = head
+            var = var or head_var
     if not exp and inline_str:
         # an assignment after sym:  sym f=func((a+b)^2),  sym f=(a+b)^2,  sym cancel x=0.34
         if op == 'simplify':
@@ -5902,6 +5996,60 @@ def _expand_func(text, simplify):
         pos = cl + 1
     out.append(text[pos:])
     return ''.join(out)
+
+
+_DIFF_RE = re.compile(r'(?<![A-Za-z0-9_])diff\s*\(')
+
+
+def _quote_diff_vars(text):
+    out, pos = [], 0
+    while True:
+        m = _DIFF_RE.search(text, pos)
+        if not m:
+            break
+        if (text.count('"', 0, m.start()) % 2) or (text.count("'", 0, m.start()) % 2):
+            out.append(text[pos:m.end()])
+            pos = m.end()
+            continue
+        op = m.end() - 1
+        try:
+            cl = _func_close(text, op)
+        except CalcError:
+            break
+        parts = [_quote_diff_vars(a) for a in _split_top_level(text[op + 1:cl], ',')]
+        first = parts[0].strip()
+        for i in (1, 2):
+            if i < len(parts) and _VAR_NAME_RE.match(parts[i].strip()):
+                name = parts[i].strip()
+                in_params = first.startswith('"') and first.endswith('"') and name in _get_lambda_params(first[1:-1])
+                assigned = re.search(r'(?<![A-Za-z0-9_])' + re.escape(name) + r'\s*(?:\*\*|//|[+\-*/|&%^])?=(?!=)', text)
+                if in_params or (name not in _stored() and not assigned):
+                    parts[i] = f'"{name}"'
+        out.append(text[pos:op + 1] + ','.join(parts) + ')')
+        pos = cl + 1
+    out.append(text[pos:])
+    return ''.join(out)
+
+
+def _sym_head(exp):
+    m = re.match(r'(expand|factor|cancel|together|apart|collect|simplify)\s*\(', exp)
+    if not m:
+        return None
+    try:
+        if _func_close(exp, m.end() - 1) != len(exp) - 1:
+            return None
+    except CalcError:
+        return None
+    args = [a.strip() for a in _split_top_level(exp[m.end():-1], ',')]
+    if not args or not args[0] or len(args) > 2:
+        return None
+    var = None
+    if len(args) == 2:
+        v = args[1].strip('"\'')
+        if not _VAR_NAME_RE.match(v):
+            return None
+        var = v
+    return _SYM_OPS[m.group(1)], args[0], var
 
 
 def _func_builtin(*args):
@@ -6419,6 +6567,9 @@ def hlp():
   {GREEN}diff(f, n)     {RST}  n-th order derivative
   {GREEN}1 + diff(f)    {RST}  arithmetic on Lambdas produces new Lambdas: "1 + cos(x)"
   {GREEN}g=diff(f)      {RST}  store derivative as Lambda g
+
+  {GREEN}diff(f, x)     {RST}  derivative with respect to the variable x;  {GREEN}diff(f, x, n){RST}  n-th order
+                   f may use expand, factor, cancel, apart, collect and simplify:  diff("expand((x+y)^3)", x)
 
 {BOLD}Quantum / physics:{RST}
   {GREEN}anharmonic(n, c){RST} anharmonic oscillator  H=p²/2+x²/2+c·x⁴, n-th eigenvalue
@@ -7954,6 +8105,7 @@ def evaluate(raw: str) -> None:
         except CalcError as ex:
             print(_fmt_error(str(ex)))
             return
+    raw = _quote_diff_vars(raw)
     inline_str, exp = split_inline(raw)
 
     targets = set(_assign_targets(inline_str))
