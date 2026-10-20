@@ -391,6 +391,21 @@ Functions support arithmetic: `f+g`, `f*2`, `f+=1`.
 diff("sin(x)")                    → "cos(x)"
 f="x**2+3x";diff(f)               → "2 * x + 3"
 diff("x**3",2)                    → "6 * x"
+diff("x**3*y", y)                 → "x ** 3"
+diff("x**4", x, 2)                → "12 * x ** 2"
+```
+
+The second argument is the variable to differentiate by, or the order. A name there is
+taken as the variable when it is unset or appears in the function, so `diff(f, x)` never
+asks for `x`; anything else is an order. `diff(f, x, n)` gives the n-th derivative by `x`.
+Without a name the first variable of the function is used.
+
+The function may use `expand`, `factor`, `cancel`, `apart`, `collect` and `simplify`. They do
+not change the value, so they are skipped while differentiating, and the answer is
+simplified:
+
+```
+diff("expand((x+y+z)^3)-(x^3+y^3+z^3)", x)   → "6x*y + 6x*z + 3y^2 + 6y*z + 3z^2"
 ```
 
 ### Integrals, limits, sums, roots
@@ -713,6 +728,22 @@ The operations are also functions, for use inside other expressions and for stor
 functions: `simplify("(x^2-1)/(x-1)")`, `expand(f)`, `factor(f)`, `cancel(f)`,
 `apart(f)`, `collect(f, "x")`, where `f` is a stored function or a text.
 
+With `sym`, they and `diff` can also be used inside the expression, and in quoted
+functions given to the other operations. `sym expand(e)`, `sym factor(e)` and the other
+operations written as a call do the same as `sym expand e`:
+
+```
+>> sym expand((x + y + z)^3 - (x^3 + y^3 + z^3))
+3x^2*y + 3x^2*z + 3x*y^2 + 6x*y*z + 3x*z^2 + 3y^2*z + 3y*z^2
+>> sym diff("expand((x + y + z)^3) - (x^3 + y^3 + z^3)", x)
+6x*y + 6x*z + 3y^2 + 6y*z + 3z^2
+>> simplify("diff(ln(sqrt((1 + sin(x)) / (1 - sin(x)))), x)")
+1/cos(x)
+```
+
+`diff(e, x)` there takes the derivative by `x` (or `diff(e)` when there is one variable,
+`diff(e, x, n)` for the n-th) and the answer is simplified.
+
 ### Assignments after an operation
 
 An operation in front of an assignment stores the result of that operation as a quoted
@@ -759,6 +790,8 @@ together. With `sym on`, and after `sym`, the result is simplified.
 - `sin`, `cos`, `sinh`, `cosh` identities (`sin(x)^2+cos(x)^2` is `1`), exact values
   at multiples of `pi/12`, parity (`sin(-x)` is `-sin(x)`), `asin(sin(pi/6))` style
   compositions, `ln` of rationals, `exp(ln(x))`, `abs` of products.
+- Derivatives: `diff` of products, quotients, powers and the usual functions, inside any
+  expression.
 - `pi`, `e`, imaginary units and stored constants stay symbols.
 - Other functions (`tan`, `gamma`, ...) are kept as they are, with simplified arguments.
 
