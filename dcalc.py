@@ -48,7 +48,7 @@ except ImportError:
 # INTERNAL VARIABLES
 
 
-VERSION       = "1.1.2"
+VERSION       = "1.1.3"
 dec           = decimal.Decimal
 ctx           = decimal.getcontext()
 ctx.prec      = 50
